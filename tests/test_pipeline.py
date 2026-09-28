@@ -117,8 +117,17 @@ class MockLLMProvider:
             )
         elif "EmailGenResponse" in str(schema):
             return EmailGenResponse(
-                subject="Exciting role at MockTech",
-                body_html="<p>Hi Alice, I love your product...</p>",
+                subject="Internship interest at MockTech",
+                body_html=(
+                    "<p>Hi Alice,</p><p>I read about MockTech's recent Series A and the new workflow automation "
+                    "product your team shipped for mid-sized finance teams this quarter.</p><p>I am a third-year "
+                    "computer science student and interned at Jio Platforms, where I worked on systems that collect "
+                    "and analyse large volumes of telemetry data.</p><p>That experience with dependable data "
+                    "pipelines seems close to the reliability problems your platform solves for customers every "
+                    "day.</p><p>I would love to be considered for relevant software engineering internship "
+                    "opportunities on your team.</p><p>If there is a suitable opening, I would be grateful for a "
+                    "referral or any guidance on who to contact.</p><p>Best,<br>Jane Doe</p>"
+                ),
             )
         elif "ValidationResponse" in str(schema):
             return ValidationResponse(is_valid=True, errors=[])
@@ -169,6 +178,8 @@ def test_pipeline_integration(tmp_path):
     config_data = load_config("config.example.yaml")
     # Set paths to temp directories to avoid writing to project root during tests
     config_data.pipeline.db_path = ":memory:"
+    # Pure LLM scoring so the weighted score is exactly predictable from the mock (hybrid is tested separately)
+    config_data.scoring.mode = "llm"
 
     # Write a temporary resume file for testing
     temp_resume = tmp_path / "resume.typ"
@@ -386,8 +397,8 @@ def test_retry_failed_fk_safety(tmp_path):
 
 
 def test_stage_7_resume_selection_and_toggle(tmp_path):
+    from src.db.models import Application, Company, Job, ResumeVersion, Run
     from src.pipeline.stages import run_stage_7_resume_tailoring
-    from src.db.models import Company, Job, Application, ResumeVersion, Run
 
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)

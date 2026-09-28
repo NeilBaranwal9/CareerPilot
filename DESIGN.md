@@ -25,7 +25,8 @@ graph TD
     S2 -.-> |Excluded| T_Exc[Terminal: Excluded Company / Ghost Job]
     S4 -.-> |Duplicate Contact| T_Dup[Terminal: Duplicate]
     S5 -.-> |Email Not Found| T_NoEmail[Terminal: No Professional Email]
-    S6 -.-> |Low Score| T_LowScore[Terminal: Salary Too Low]
+    S3 -.-> |Poor Fit| T_PoorFit[Terminal: Poor Fit]
+    S6 -.-> |Low Score| T_LowScore[Terminal: Low Score]
     S9 -.-> |Validation Fail| T_ValFail[Terminal: Validation Failed]
     S10 -.-> |Gmail Auth Fail| T_DraftFail[Terminal: Draft Failed]
 ```
@@ -48,51 +49,85 @@ The project conforms to a clean, package-centric Python structure:
 ├── logs/
 │   └── platform.log     # Structured pipeline execution logs
 ├── src/
-│   ├── __init__.py
-│   ├── cli.py           # Typer command-line interface
-│   ├── config.py        # Pydantic configuration parser
-│   ├── web_server.py    # Web server serving REST APIs & status dashboard
-│   ├── static/          # Web widget & dashboard frontend (index.html)
+│   ├── cli.py           # Typer CLI (campaign, discover, outreach, funnel, daemon, doctor, ...)
+│   ├── config.py        # Pydantic configuration (all new sections optional with defaults)
+│   ├── scheduler.py     # Daemon loop + Windows Task Scheduler / systemd installers + automation failsafe
+│   ├── web_server.py    # REST API (status, funnel, campaigns, companies, contacts) & dashboard
+│   ├── static/          # Dashboard frontend (index.html)
 │   ├── db/
-│   │   ├── __init__.py
-│   │   ├── models.py    # SQLAlchemy database models
-│   │   └── session.py   # Database session factory & foreign key pragma
+│   │   ├── models.py    # SQLAlchemy models (companies, jobs, contacts, applications, emails, campaigns, outreach_events, ...)
+│   │   └── session.py   # Engine/session factory + automatic column migration
 │   ├── pipeline/
-│   │   ├── __init__.py
-│   │   ├── runner.py    # Run state machine orchestrator
-│   │   └── stages.py    # Stage-by-stage implementation logic
+│   │   ├── runner.py    # Orchestrator: run, targeted, campaigns, discover-only, outreach cycle, daily
+│   │   ├── stages.py    # Stage 0-11 implementations
+│   │   ├── campaign.py  # Natural-language goal parsing & campaign progress
+│   │   └── schemas.py   # Pydantic schemas for structured LLM output
+│   ├── sources/
+│   │   ├── companies.py # Company discovery: LLM, list articles, YC directory, LinkedIn jobs, Wellfound, ATS boards
+│   │   ├── ats.py       # Greenhouse / Lever / Ashby / Workable / SmartRecruiters board APIs + detection
+│   │   ├── job_boards.py# LinkedIn guest jobs API, Wellfound & Indeed via search results
+│   │   ├── contacts.py  # Contact discovery (LinkedIn search results, team pages, press, GitHub, Hunter, Apollo) & ranking
+│   │   ├── emails.py    # Email finding + SMTP/catch-all/Hunter verification
+│   │   └── enrichment.py# Hunter, Apollo and GitHub API clients
+│   ├── intel/
+│   │   ├── classify.py  # Sector, funding stage, role/persona, headcount & salary parsing
+│   │   ├── scoring.py   # Company fit + rule-based opportunity scoring (hybrid with LLM)
+│   │   └── learning.py  # Reply/interview outcome learning & response-probability estimates
+│   ├── outreach/
+│   │   ├── personas.py  # Persona guidelines, tones, follow-up prompt & templates
+│   │   ├── scheduling.py# Send windows (timezone-aware)
+│   │   └── engine.py    # Send due, threaded follow-ups, reply/bounce/OOO detection, stop-on-reply
+│   ├── analytics/
+│   │   └── funnel.py    # Conversion funnel, verification stats, outcome breakdowns
 │   ├── providers/
-│   │   ├── __init__.py
-│   │   ├── browser.py   # HTTP / Playwright scrapper
-│   │   ├── gmail.py     # OAuth Gmail compose draft builder
-│   │   └── llm/         # LLM vendor implementations (Local AGY, OpenAI, Claude, Gemini)
+│   │   ├── browser.py   # HTTP / Playwright fetching, JSON APIs, DuckDuckGo/Yahoo/Serper/Brave search
+│   │   ├── gmail.py     # Gmail drafts, send, threads, scopes
+│   │   └── llm/         # Groq (default), OpenAI, Anthropic, Gemini, local AGY
 │   └── utils/
-│       ├── __init__.py
+│       ├── email_verifier.py # Syntax/MX, patterns & inference, SMTP RCPT probe, catch-all detection
+│       ├── resume.py    # Resume variant selection, highlight ranking, Typst text extraction
 │       ├── caching.py   # SQLite-backed key-value caching with TTL
 │       └── logging.py   # Structured logging utility (Console Rich + File JSON)
-└── tests/
-    ├── __init__.py
-    ├── test_caching.py  # Cache unit tests
-    ├── test_config.py   # Config parsing tests
-    ├── test_pipeline.py # Mock pipeline integration tests
-    └── test_scoring.py  # Opportunity scoring tests
+└── tests/               # 79 tests: pipeline, campaigns, Groq provider, sources, email finding, outreach engine, intel
 ```
 
 ## Database Schema (SQLite)
 
 The database schema utilizes normalized tables to maintain data integrity and track state:
 
-| Table Name | Primary Key | Key Columns / Foreign Keys | Description |
-| :--- | :--- | :--- | :--- |
-| **`runs`** | `id` (String) | `started_at`, `status` | Tracks every CLI/TUI pipeline session. |
-| **`companies`** | `id` (Integer) | `name` (unique), `domain`, `research_data` (JSON) | Caches researched information per company. |
-| **`jobs`** | `id` (Integer) | `company_id` (FK), `title`, `url`, `salary`, `experience_years_required` | Stores open jobs matching initial preferences. |
-| **`contacts`** | `id` (Integer) | `company_id` (FK), `name`, `role`, `email` | Tracks individual contacts; enforces single outreach per contact/company. |
-| **`applications`** | `id` (Integer) | `run_id` (FK), `job_id` (FK), `contact_id` (FK), `current_stage`, `state` | Core state tracker mapping a job to progress stages and scoring weights. |
-| **`emails`** | `id` (Integer) | `application_id` (FK), `subject`, `body` (HTML), `gmail_draft_id` | Stores generated HTML cold emails and Gmail draft links. |
-| **`resume_versions`**| `id` (Integer) | `application_id` (FK), `path`, `keywords_added`, `reasoning` | References custom generated resume versions. |
-| **`history`** | `id` (Integer) | `application_id` (FK), `stage`, `state`, `run_id` | Maintains historical state transition logs for every application. |
-| **`cache_entries`** | `key` (String) | `value` (JSON), `expires_at` | General key-value request, search, and LLM cache. |
+| Table Name | Key Columns | Description |
+| :--- | :--- | :--- |
+| **`runs`** | `id`, `status` | Every pipeline session. |
+| **`campaigns`** | `goal`, `spec` (JSON), `target_companies`, `personas`, `auto_send`, `status` | Natural-language outreach goals driven across days. |
+| **`companies`** | `name`, `domain`, `sector`, `sub_sectors`, `funding_stage`, `employee_count`, `hiring_status`, `tech_stack`, `recent_news`, `fit_score`, `response_probability`, `status`, `email_pattern`, `is_catch_all`, `ats_provider/token`, `source`, `campaign_id` | Company intelligence, fit and lifecycle (candidate → target/rejected → contacted). |
+| **`jobs`** | `company_id`, `title`, `url`, `source`, `description`, `experience_years_required` | Postings from ATS boards, LinkedIn, careers pages, Wellfound, Indeed or speculative. |
+| **`contacts`** | `company_id`, `name`, `role`, `role_category`, `source`, `linkedin_url`, `background`, `rank_score`, `email`, `email_status`, `email_confidence`, `rejected_emails`, `do_not_contact` | Every person found, classified and ranked. |
+| **`applications`** | `job_id`, `contact_id`, `current_stage`, `state`, `score`, `score_breakdown`, `persona`, `campaign_id`, `outreach_status`, `sent_at`, `replied_at`, `interview_at`, `reply_category`, `response_probability` | Pipeline state + outreach outcome per company thread. |
+| **`emails`** | `application_id`, `sequence_step` (0 = initial, 1..n = follow-ups), `status`, `gmail_draft_id`, `gmail_thread_id`, `rfc_message_id`, `scheduled_at`, `sent_at`, `tone`, `persona` | The full email sequence per application. |
+| **`outreach_events`** | `application_id`, `event_type`, `gmail_message_id`, `details` | Timeline: drafted, sent, follow-up sent, reply, auto_reply, bounce, cancelled, duplicate_blocked. |
+| **`resume_versions`** | `application_id`, `variant`, `highlights_order`, `path`, `keywords_added`, `reasoning` | Resume variant and tailoring per application. |
+| **`history`** | `application_id`, `stage`, `state`, `run_id` | Stage transition audit log. |
+| **`cache_entries`** | `key`, `value`, `expires_at` | Search/LLM/discovery cache. |
+
+New columns are added to existing databases automatically on startup (`auto_migrate`).
+
+## Outreach Lifecycle
+
+```mermaid
+graph LR
+    D[drafted] -->|auto_send| S[scheduled] --> X[sent]
+    D -->|you send from Gmail| X
+    X --> F[followed_up]
+    X --> R[replied] --> I[interview]
+    F --> R
+    X --> B[bounced] -->|retry_on_bounce| E[Stage 5: next-best email]
+    X --> N[not_interested]
+    F --> Z[no_response]
+```
+
+The outreach engine (`outreach` command, `daemon`, or scheduled task) runs: sync manual sends → check replies
+(human / auto-reply / bounce, LLM-classified) → send due emails in the send window → draft/send due follow-ups as
+threaded replies (never after a reply) → close silent sequences.
 
 ## Resumability & Error Recovery
 

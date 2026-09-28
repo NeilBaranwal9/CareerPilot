@@ -594,6 +594,14 @@
       outline: none;
       border-color: var(--accent-cyan);
     }
+    .funnel-bars { display: flex; flex-direction: column; gap: 10px; background: var(--card-bg); border: 1px solid var(--card-border); border-radius: 12px; padding: 18px; }
+    .funnel-row { display: grid; grid-template-columns: 150px 1fr 70px 70px; align-items: center; gap: 12px; }
+    .funnel-label { font-size: 13px; color: var(--text-main); }
+    .funnel-track { height: 18px; background: rgba(255, 255, 255, 0.05); border-radius: 9px; overflow: hidden; }
+    .funnel-fill { height: 100%; border-radius: 9px; background: linear-gradient(90deg, var(--accent-blue), var(--accent-cyan)); transition: width 0.4s ease; }
+    .funnel-count { font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; }
+    .funnel-pct { font-size: 12px; color: var(--text-muted); text-align: right; font-variant-numeric: tabular-nums; }
+    @media (max-width: 640px) { .funnel-row { grid-template-columns: 1fr 50px; } .funnel-track, .funnel-pct { display: none; } }
   </style>
 </head>
 <body>
@@ -610,6 +618,7 @@
 
     <div class="nav-tabs">
       <button class="nav-btn active" data-tab="tab-dashboard">📊 Dashboard</button>
+      <button class="nav-btn" data-tab="tab-funnel">📈 Funnel</button>
       <button class="nav-btn" data-tab="tab-applications">📋 Applications</button>
       <button class="nav-btn" data-tab="tab-db">🗄️ DB Explorer</button>
       <button class="nav-btn" data-tab="tab-config-logs">⚙️ Config & Logs</button>
@@ -656,6 +665,8 @@
           <button id="retryFailedBtn" class="btn btn-amber" title="Reset failed stages and retry">🔄 Retry Failed</button>
           <button id="cleanInvalidBtn" class="btn" title="Clean invalid emails & unreachable domain states">🧹 Clean Invalid Emails</button>
           <button id="exportDataBtn" class="btn" title="Export applications data to CSV and JSON">📊 Export Data</button>
+          <button id="outreachCycleBtn" class="btn" style="background: rgba(16, 185, 129, 0.16); border-color: var(--accent-green); color: var(--accent-green);" title="Detect replies/bounces, send due emails and follow-ups">📬 Outreach Cycle</button>
+          <button id="dailyRunBtn" class="btn" style="background: rgba(168, 85, 247, 0.16); border-color: var(--accent-purple); color: var(--accent-purple);" title="Continue campaigns, discover new companies, draft & track">📅 Daily Run</button>
         </div>
         <div id="actionStatusMsg" class="action-status-msg">
           <div class="live-pulse"></div> Status: Pipeline Idle
@@ -696,6 +707,32 @@
           <tbody id="dashboardAppsTableBody">
             <tr><td colspan="7" style="text-align: center; color: var(--text-muted);">Loading active applications...</td></tr>
           </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- FUNNEL TAB -->
+    <div id="tab-funnel" class="tab-content">
+      <div class="section-title" style="display: flex; justify-content: space-between; align-items: center;">
+        <span>Conversion Funnel</span>
+        <select id="funnelCampaignSelect" class="search-input" style="max-width: 320px;">
+          <option value="">All outreach</option>
+        </select>
+      </div>
+      <div id="funnelBars" class="funnel-bars"><div style="color: var(--text-muted);">Loading funnel...</div></div>
+      <div class="stats-grid" style="margin-top: 18px;">
+        <div class="stat-card"><span class="stat-label">Reply Rate</span><span id="funnel-reply-rate" class="stat-value" style="color: var(--accent-green);">0%</span></div>
+        <div class="stat-card"><span class="stat-label">Interview Rate</span><span id="funnel-interview-rate" class="stat-value" style="color: var(--accent-purple);">0%</span></div>
+        <div class="stat-card"><span class="stat-label">SMTP-Verified Emails</span><span id="funnel-verified" class="stat-value" style="color: var(--accent-cyan);">0%</span></div>
+        <div class="stat-card"><span class="stat-label">Rejected (Poor Fit) / Bounced</span><span id="funnel-rejected" class="stat-value" style="color: var(--accent-amber);">0 / 0</span></div>
+      </div>
+      <div class="section-title" style="margin-top: 18px;"><span>Campaigns</span></div>
+      <div class="table-container">
+        <table>
+          <thead>
+            <tr><th>ID</th><th>Goal</th><th>Status</th><th>Target</th><th>Qualified</th><th>Rejected</th><th>Drafts</th><th>Sent</th><th>Replies</th><th>Interviews</th></tr>
+          </thead>
+          <tbody id="campaignsTableBody"><tr><td colspan="10" style="text-align: center; color: var(--text-muted);">No campaigns yet. Start one with <code>recruiting-platform campaign "Find 200 fintech companies in India"</code></td></tr></tbody>
         </table>
       </div>
     </div>
@@ -754,7 +791,7 @@
         <div class="table-container">
           <table>
             <thead>
-              <tr><th>ID</th><th>Name</th><th>Domain</th><th>Industry</th><th>Employees</th></tr>
+              <tr><th>ID</th><th>Name</th><th>Domain</th><th>Sector</th><th>Funding</th><th>Employees</th><th>Hiring</th><th>Fit</th><th>Reply Prob.</th><th>Status</th></tr>
             </thead>
             <tbody id="companiesTableBody"></tbody>
           </table>
@@ -765,7 +802,7 @@
         <div class="table-container">
           <table>
             <thead>
-              <tr><th>ID</th><th>Company</th><th>Name</th><th>Role</th><th>Email</th></tr>
+              <tr><th>ID</th><th>Company</th><th>Name</th><th>Role</th><th>Persona</th><th>Email</th><th>Email Status</th><th>Source</th></tr>
             </thead>
             <tbody id="contactsTableBody"></tbody>
           </table>
@@ -980,8 +1017,13 @@
             <td>${c.id}</td>
             <td><strong>${escapeHtml(c.name)}</strong></td>
             <td>${escapeHtml(c.domain)}</td>
-            <td>${escapeHtml(c.industry)}</td>
+            <td>${escapeHtml(c.sector)}</td>
+            <td>${escapeHtml(c.funding_stage)}</td>
             <td>${escapeHtml(c.employee_count)}</td>
+            <td>${escapeHtml(c.hiring_status)}</td>
+            <td>${c.fit_score != null ? c.fit_score.toFixed(2) : '-'}</td>
+            <td>${c.response_probability != null ? (c.response_probability * 100).toFixed(1) + '%' : '-'}</td>
+            <td>${escapeHtml(c.status)}</td>
           </tr>
         `).join('');
 
@@ -992,7 +1034,10 @@
             <td>${escapeHtml(c.company_name)}</td>
             <td><strong>${escapeHtml(c.name)}</strong></td>
             <td>${escapeHtml(c.role)}</td>
+            <td>${escapeHtml(c.role_category)}</td>
             <td><a href="mailto:${escapeHtml(c.email)}" style="color: var(--accent-cyan); text-decoration: none;">${escapeHtml(c.email)}</a></td>
+            <td>${escapeHtml(c.email_status)}</td>
+            <td>${escapeHtml(c.source)}</td>
           </tr>
         `).join('');
 
@@ -1009,6 +1054,51 @@
 
       } catch (e) {
         console.error('Error fetching DB explorer data:', e);
+      }
+    }
+
+    async function fetchFunnel() {
+      try {
+        const select = document.getElementById('funnelCampaignSelect');
+        const campaignId = select.value;
+        const [funnelRes, campRes] = await Promise.all([
+          fetch('/api/funnel' + (campaignId ? `?campaign=${campaignId}` : '')),
+          fetch('/api/campaigns')
+        ]);
+        const funnel = await funnelRes.json();
+        const campaigns = await campRes.json();
+        const rows = funnel.funnel || [];
+        const top = Math.max(1, ...rows.map(r => r.count));
+        document.getElementById('funnelBars').innerHTML = rows.length ? rows.map(r => `
+          <div class="funnel-row">
+            <div class="funnel-label">${escapeHtml(r.stage)}</div>
+            <div class="funnel-track"><div class="funnel-fill" style="width: ${Math.max(r.count ? 2 : 0, 100 * r.count / top)}%;"></div></div>
+            <div class="funnel-count">${r.count}</div>
+            <div class="funnel-pct">${r.pct_of_previous != null ? r.pct_of_previous + '%' : ''}</div>
+          </div>`).join('') : '<div style="color: var(--text-muted);">No data yet.</div>';
+        const extra = funnel.extra || {};
+        const ver = funnel.verification || {};
+        document.getElementById('funnel-reply-rate').textContent = `${extra.reply_rate || 0}%`;
+        document.getElementById('funnel-interview-rate').textContent = `${extra.interview_rate || 0}%`;
+        document.getElementById('funnel-verified').textContent = `${ver.smtp_verified_pct || 0}%`;
+        document.getElementById('funnel-rejected').textContent = `${extra.rejected_companies || 0} / ${extra.bounced || 0}`;
+
+        if (Array.isArray(campaigns)) {
+          const current = select.value;
+          select.innerHTML = '<option value="">All outreach</option>' + campaigns.map(c =>
+            `<option value="${c.id}">#${c.id} ${escapeHtml(String(c.goal).slice(0, 48))}</option>`).join('');
+          select.value = current;
+          if (campaigns.length) {
+            document.getElementById('campaignsTableBody').innerHTML = campaigns.map(c => `
+              <tr>
+                <td>${c.id}</td><td>${escapeHtml(c.goal)}</td><td>${escapeHtml(c.status)}</td><td>${c.target}</td>
+                <td>${c.companies_qualified}</td><td>${c.companies_rejected}</td><td>${c.drafts}</td><td>${c.sent}</td>
+                <td>${c.replies}</td><td>${c.interviews}</td>
+              </tr>`).join('');
+          }
+        }
+      } catch (e) {
+        console.error('Error fetching funnel:', e);
       }
     }
 
@@ -1324,6 +1414,9 @@
     const purgeAppBtn = document.getElementById('purgeNonWorkingEmailsBtn');
     if (purgeAppBtn) purgeAppBtn.addEventListener('click', () => triggerAction('/api/actions/clean_invalid'));
     document.getElementById('exportDataBtn').addEventListener('click', () => triggerAction('/api/actions/export'));
+    document.getElementById('outreachCycleBtn').addEventListener('click', () => triggerAction('/api/actions/outreach'));
+    document.getElementById('dailyRunBtn').addEventListener('click', () => triggerAction('/api/actions/daily'));
+    document.getElementById('funnelCampaignSelect').addEventListener('change', fetchFunnel);
     
     const inspectMarkBtn = document.getElementById('inspectMarkNonExistentBtn');
     if (inspectMarkBtn) inspectMarkBtn.addEventListener('click', () => markEmailNonExistent(currentInspectedAppId));
@@ -1388,6 +1481,7 @@
       fetchApplications();
       fetchDatabaseExplorer();
       fetchConfigAndLogs();
+      fetchFunnel();
     }
 
     // --- Initial Load & Polling ---

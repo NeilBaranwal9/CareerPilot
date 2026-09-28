@@ -20,6 +20,9 @@ dependencies = [
     "google-api-python-client>=2.111.0",
     "curl-cffi>=0.7.0",
     "dnspython>=2.5.0",
+    "tzdata>=2024.1",
+    "pypdf>=4.0.0",
+    "fpdf2>=2.7.0",
 ]
 
 [project.scripts]

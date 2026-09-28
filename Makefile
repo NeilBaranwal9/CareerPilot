@@ -1,9 +1,11 @@
 export TARGET := $(target)
 export JD := $(jd)
+export GOAL := $(goal)
+export QUERY := $(query)
 
 .DEFAULT_GOAL := default
 
-.PHONY: default install lint test run search research tailor draft retry resume send-scheduled auth ui widget export clean-invalid clean format migrate help target targeted status
+.PHONY: default install lint test run search research tailor draft retry resume send-scheduled auth ui widget export clean-invalid clean format migrate help target targeted status campaign campaigns discover companies outreach funnel insights daily daemon schedule-install doctor
 
 default:
 ifneq ($(target),)
@@ -33,6 +35,17 @@ help:
 	@echo "  make send-scheduled - Send drafts whose scheduled time has passed"
 	@echo "  make auth          - Authenticate Gmail API connection interactively"
 	@echo "  make target        - Run targeted outreach (e.g. make target target=\"ElevenLabs\")"
+	@echo "  make campaign      - Start a campaign (e.g. make campaign goal=\"Find 200 fintech companies in India\")"
+	@echo "  make campaigns     - List campaigns and progress"
+	@echo "  make discover      - Build a target list (e.g. make discover query=\"Series A/B AI startups\")"
+	@echo "  make companies     - Rank companies by fit & reply probability"
+	@echo "  make outreach      - Replies/bounces, send due emails, follow-ups"
+	@echo "  make funnel        - Show the conversion funnel"
+	@echo "  make insights      - Reply rates by sector/persona/resume variant"
+	@echo "  make daily         - One full automation cycle"
+	@echo "  make daemon        - Run continuously (daily discovery + outreach every 15 min)"
+	@echo "  make schedule-install - Install OS scheduler (Windows Task Scheduler / systemd)"
+	@echo "  make doctor        - Check Groq, Gmail scopes, SMTP port 25, Typst, API keys"
 	@echo "  make status        - Check status of systemd service, timer, and recent logs"
 	@echo "  make clean         - Clean temporary Python files and logs"
 
@@ -90,6 +103,39 @@ auth:
 
 target targeted:
 	uv run recruiting-platform targeted "$(TARGET)"
+
+campaign:
+	uv run recruiting-platform campaign "$(GOAL)"
+
+campaigns:
+	uv run recruiting-platform campaigns
+
+discover:
+	uv run recruiting-platform discover "$(QUERY)" --research
+
+companies:
+	uv run recruiting-platform companies
+
+outreach:
+	uv run recruiting-platform outreach
+
+funnel:
+	uv run recruiting-platform funnel
+
+insights:
+	uv run recruiting-platform insights
+
+daily:
+	uv run recruiting-platform daily
+
+daemon:
+	uv run recruiting-platform daemon
+
+schedule-install:
+	uv run recruiting-platform schedule install
+
+doctor:
+	uv run recruiting-platform doctor
 
 status:
 	@echo "=== systemd UI Service Status ==="

@@ -1,7 +1,9 @@
 import json
 import logging
 import os
+import time
 import urllib.parse
+from typing import Any
 
 import httpx
 import urllib3
@@ -32,7 +34,87 @@ class BrowserProvider:
         self.playwright_active = False
         self.run_failures: dict[str, int] = {}
         self.run_successes: dict[str, int] = {}
+        self.search_provider = "duckduckgo"
+        self.serper_key = ""
+        self.brave_key = ""
+        self.min_search_interval = 1.0
+        self._last_search_at = 0.0
+        self._search_cache: dict[tuple[str, int, bool], list[dict[str, str]]] = {}
         self._load_domain_stats()
+
+    def configure_search(
+        self,
+        provider: str = "auto",
+        serper_key: str = "",
+        brave_key: str = "",
+        min_interval_seconds: float = 1.0,
+    ) -> None:
+        """
+        Selects the web search backend. "auto" prefers Serper (Google results) or Brave when an API key
+        is configured, and otherwise uses keyless DuckDuckGo with a Yahoo fallback.
+        """
+        self.serper_key = serper_key
+        self.brave_key = brave_key
+        self.min_search_interval = max(0.0, min_interval_seconds)
+        provider = (provider or "auto").lower()
+        if provider == "auto":
+            provider = "serper" if serper_key else "brave" if brave_key else "duckduckgo"
+        self.search_provider = provider
+
+    @staticmethod
+    def is_placeholder_result(result: dict[str, str]) -> bool:
+        """True for the synthetic result emitted when every search engine failed."""
+        return result.get("url", "").startswith("https://example.com/search")
+
+    def fetch_json(
+        self,
+        url: str,
+        method: str = "GET",
+        headers: dict[str, str] | None = None,
+        params: dict[str, Any] | None = None,
+        json_body: Any = None,
+        timeout: float = 20.0,
+    ) -> Any:
+        """Performs an HTTP request against a JSON API (ATS boards, GitHub, Hunter, Apollo) and returns parsed JSON."""
+        request_headers = {"User-Agent": HEADERS["User-Agent"], "Accept": "application/json"}
+        if headers:
+            request_headers.update(headers)
+        with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+            response = client.request(method, url, headers=request_headers, params=params, json=json_body)
+        if response.status_code >= 400:
+            raise RuntimeError(f"{method} {url} returned HTTP {response.status_code}: {response.text[:200]}")
+        return response.json()
+
+    def _throttle_search(self) -> None:
+        wait = self.min_search_interval - (time.monotonic() - self._last_search_at)
+        if wait > 0:
+            time.sleep(wait)
+        self._last_search_at = time.monotonic()
+
+    def _search_serper(self, query: str, num_results: int) -> list[dict[str, str]]:
+        data = self.fetch_json(
+            "https://google.serper.dev/search",
+            method="POST",
+            headers={"X-API-KEY": self.serper_key, "Content-Type": "application/json"},
+            json_body={"q": query, "num": max(num_results, 10)},
+        )
+        return [
+            {"title": str(r.get("title", "")), "url": str(r.get("link", "")), "snippet": str(r.get("snippet", ""))}
+            for r in data.get("organic", [])
+            if r.get("link")
+        ]
+
+    def _search_brave(self, query: str, num_results: int) -> list[dict[str, str]]:
+        data = self.fetch_json(
+            "https://api.search.brave.com/res/v1/web/search",
+            headers={"X-Subscription-Token": self.brave_key},
+            params={"q": query, "count": min(max(num_results, 10), 20)},
+        )
+        return [
+            {"title": str(r.get("title", "")), "url": str(r.get("url", "")), "snippet": str(r.get("description", ""))}
+            for r in data.get("web", {}).get("results", [])
+            if r.get("url")
+        ]
 
     def _get_domain(self, url: str) -> str:
         """Helper to extract clean domain name from URL."""
@@ -233,15 +315,43 @@ class BrowserProvider:
 
         return cleaned_text
 
-    def search_google(self, query: str, num_results: int = 5) -> list[dict[str, str]]:
+    def search_google(self, query: str, num_results: int = 5, include_blocked: bool = False) -> list[dict[str, str]]:
         """
         Runs a search and parses organic results.
-        Tries DuckDuckGo first, falls back to Yahoo Search if blocked or 0 results.
+        Uses Serper/Brave when configured, otherwise DuckDuckGo with a Yahoo Search fallback.
+        With include_blocked=True, results on scraper-hostile domains (e.g. linkedin.com) are kept so their
+        titles/snippets can be mined without fetching the pages themselves.
         """
+        cache_key = (query, num_results, include_blocked)
+        if cache_key in self._search_cache:
+            return list(self._search_cache[cache_key])
+
         encoded_query = urllib.parse.quote_plus(query)
         url = f"https://html.duckduckgo.com/html/?q={encoded_query}"
+        self._throttle_search()
 
-        results = []
+        results: list[dict[str, str]] = []
+
+        # 0. Keyed search APIs (more reliable, Google-quality results)
+        if self.search_provider in ("serper", "brave"):
+            try:
+                api_results = (
+                    self._search_serper(query, num_results)
+                    if self.search_provider == "serper"
+                    else self._search_brave(query, num_results)
+                )
+                for r in api_results:
+                    if not include_blocked and self._get_domain(r["url"]) in self.disabled_domains:
+                        continue
+                    results.append(r)
+                    if len(results) >= num_results:
+                        break
+            except Exception as e:
+                logger.warning(f"{self.search_provider} search failed for '{query}': {e}. Falling back to DuckDuckGo.")
+            if results:
+                self._search_cache[cache_key] = list(results)
+                return results
+
         # 1. Try DuckDuckGo
         try:
             html = self.fetch_page_http(url)
@@ -257,7 +367,9 @@ class BrowserProvider:
                 if not title_elem:
                     continue
 
-                title = title_elem.get_text().strip()
+                # `result__a` holds the page title; `result__url` only shows the display URL.
+                title_link = parent.find("a", class_="result__a")
+                title = (title_link or title_elem).get_text().strip()
                 href = title_elem.get("href", "").strip()
 
                 # Clean DuckDuckGo redirect URLs if necessary
@@ -272,7 +384,7 @@ class BrowserProvider:
 
                 # Filter out disabled domains
                 domain = self._get_domain(href)
-                if domain in self.disabled_domains:
+                if not include_blocked and domain in self.disabled_domains:
                     continue
 
                 snippet = link.get_text().strip()
@@ -305,11 +417,12 @@ class BrowserProvider:
                             
                             # Filter out disabled domains
                             domain = self._get_domain(dest_url)
-                            if domain in self.disabled_domains:
+                            if not include_blocked and domain in self.disabled_domains:
                                 continue
 
                             title = a.get_text().strip()
-                            h3 = a.find_parent("h3")
+                            # Yahoo nests the <h3> title inside the link (next to site/breadcrumb spans)
+                            h3 = a.find("h3") or a.find_parent("h3")
                             if h3:
                                 title = h3.get_text().strip()
 
@@ -324,6 +437,9 @@ class BrowserProvider:
                                 break
             except Exception as ye:
                 logger.error(f"Yahoo Search also failed for query '{query}': {ye}")
+
+        if results:
+            self._search_cache[cache_key] = list(results)
 
         # 3. If both failed, generate placeholder search results to ensure continuity
         if not results:

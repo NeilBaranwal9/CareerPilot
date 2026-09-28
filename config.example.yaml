@@ -2,6 +2,7 @@
 # Copy this file to config.yaml and fill in your personal details.
 #   cp config.example.yaml config.yaml
 # config.yaml is git-ignored so your preferences stay private.
+# Every section below the "Scoring" block is optional; defaults are used when omitted.
 
 # ──────────────────────────────────────────────────────────
 # Your Identity  (used for email sign-offs & resume fallback)
@@ -39,7 +40,7 @@ job_preferences:
     min_employees: 100
     max_employees: 1000
   experience_years_max: 1.0
-  allow_speculative_outreach: true
+  allow_speculative_outreach: true   # reach companies even when they have no public job posting
 
 # ──────────────────────────────────────────────────────────
 # Exclusions
@@ -52,6 +53,8 @@ exclusions:
     - "Staffing Agency"
     - "Recruitment Agency"
     - "Contract"
+  emails: []    # never email these addresses
+  domains: []   # never email anyone at these domains
 
 # ──────────────────────────────────────────────────────────
 # Pipeline & Email Settings
@@ -61,37 +64,51 @@ pipeline:
   research_depth: "detailed"
   cache_lifetime_seconds: 86400
   retry_limits: 3
-  generate_resume: false   # If false, uses pre-built AI or Base resume; if true, LLM tailors a new resume
+  generate_resume: false   # If false, uses the best pre-built resume variant; if true, the LLM tailors bullets/order too
+  # Legacy single-resume fallback (used only when none of the `resumes:` variants below exist on disk)
   ai_resume_path: "/mnt/bridge/dev/personal/resume/resume_vineet_kushwaha_ai.typ"
   base_resume_path: "/mnt/bridge/dev/personal/resume/resume_vineet_kushwaha.typ"   # Path to YOUR Typst base resume
   generated_resumes_dir: "/mnt/bridge/dev/personal/resume/generated"
   db_path: "data/platform.db"
-  automation: true   # If true, auto-heals & starts timer; if false, kills timer
+  automation: true   # If true, re-enables the scheduled task/timer if disabled; if false, disables it
 
 # ──────────────────────────────────────────────────────────
-# LLM Configuration
+# LLM Configuration — Groq (OpenAI-compatible, very fast)
+# Get a key at https://console.groq.com/keys and either paste it below or set GROQ_API_KEY.
+# `recruiting-platform doctor` lists the models enabled for your key.
 # ──────────────────────────────────────────────────────────
 llm:
-  provider: "agy_cli"  # Options: agy_cli, local_agy, openai, anthropic, gemini
-  model: "default"
-  api_key: ""
-  api_url: "http://localhost:8000/v1"  # Default local AGY endpoint or similar local API
+  provider: "groq"  # Options: groq, agy_cli, local_agy, openai, anthropic, gemini
+  model: "llama-3.3-70b-versatile"          # writing: emails, resumes, campaign parsing, company lists
+  fast_model: "llama-3.1-8b-instant"        # extraction/classification: jobs, contacts, research, scoring, replies
+  fallback_models:                          # used automatically on long rate limits / decommissioned models
+    - "openai/gpt-oss-120b"
+    - "llama-3.1-8b-instant"
+  api_key: ""        # leave blank to use the GROQ_API_KEY environment variable
+  api_url: ""        # default https://api.groq.com/openai/v1
   temperature: 0.2
-  max_tokens: 1000
+  max_tokens: 4096
+  max_retries: 4
+  timeout_seconds: 60
 
 # ──────────────────────────────────────────────────────────
 # Gmail API Configuration
+# gmail.compose = create drafts & send; gmail.readonly = detect replies/bounces and avoid duplicates.
+# After changing scopes run `recruiting-platform auth` again.
 # ──────────────────────────────────────────────────────────
 gmail:
   credentials_file: "credentials.json"
   token_file: "token.json"
   scopes:
     - "https://www.googleapis.com/auth/gmail.compose"
+    - "https://www.googleapis.com/auth/gmail.readonly"
 
 # ──────────────────────────────────────────────────────────
 # Opportunity Scoring Weights (sum should ideally be 1.0)
 # ──────────────────────────────────────────────────────────
 scoring:
+  mode: "hybrid"      # hybrid (rules + LLM) | llm | rules
+  llm_weight: 0.5     # share of the LLM judgement in hybrid mode
   weights:
     role_match: 0.3
     tech_stack: 0.3
@@ -103,7 +120,156 @@ scoring:
     minimum_score: 0.60
 
 # ──────────────────────────────────────────────────────────
+# Target profile: what a good-fit company looks like for you
+# ──────────────────────────────────────────────────────────
+target_profile:
+  sector_weights:        # your preference order, e.g. Fintech > Trading > AI > generic SWE
+    fintech: 1.0
+    trading: 0.95
+    ai: 0.85
+    devtools: 0.7
+    saas: 0.65
+    generic: 0.5
+  allowed_sectors: []    # e.g. ["fintech", "trading"] to reject every other sector outright
+  funding_stages: ["seed", "series_a", "series_b", "series_c"]   # [] = any stage
+  skills: ["python", "fastapi", "django", "node.js", "typescript", "react", "postgresql", "docker", "gcp", "aws", "redis"]
+  min_company_fit: 0.45
+  reject_below_fit: true
+
+# ──────────────────────────────────────────────────────────
+# Discovery: where companies and jobs come from
+# ──────────────────────────────────────────────────────────
+discovery:
+  # Standing queries re-run by `daily` / `daemon` (continuous discovery). Examples:
+  #   - "Fintech companies in India"
+  #   - "Series A/B AI startups"
+  #   - "Trading companies"
+  queries: []
+  sources: ["llm", "web_search", "yc", "linkedin_jobs", "wellfound", "ats_boards"]
+  job_sources: ["ats", "linkedin", "career_page", "wellfound", "indeed", "web_search"]
+  companies_per_run: 20
+  max_jobs_per_company: 3
+  ats_boards: {}   # e.g. {greenhouse: ["razorpay"], lever: ["cred"], ashby: ["sarvam"]}
+
+# ──────────────────────────────────────────────────────────
+# Contacts: who to reach
+# ──────────────────────────────────────────────────────────
+contacts:
+  sources: ["linkedin_search", "team_page", "press", "github", "hunter", "apollo"]
+  personas: ["engineering_manager", "hiring_manager", "recruiter", "founder", "cto", "tech_lead"]
+  persona_strategy: "auto"        # auto = founders at small startups, EMs/recruiters at bigger companies; ordered = follow list
+  max_contacts_per_company: 1     # 2 = e.g. engineering manager AND recruiter (separate threads)
+  allow_generic_inbox: true       # fall back to careers@/hiring@ when no person is found
+
+# ──────────────────────────────────────────────────────────
+# Email verification
+# ──────────────────────────────────────────────────────────
+email_verification:
+  smtp_check: true        # RCPT TO probe + catch-all detection (needs outbound port 25; see `doctor`)
+  smtp_timeout: 8
+  smtp_from: ""           # MAIL FROM used for probing (defaults to user_identity.email)
+  helo_host: ""
+  allow_catch_all: true   # accept the best-evidence address on catch-all domains
+  allow_unverified: true  # accept the best-evidence address when SMTP can't answer (blocked port / greylisting)
+  min_confidence: 0.3
+  max_smtp_probes: 6
+
+# ──────────────────────────────────────────────────────────
+# Optional API keys (blank = read env vars HUNTER_API_KEY, APOLLO_API_KEY, GITHUB_TOKEN, SERPER_API_KEY, BRAVE_API_KEY)
+# ──────────────────────────────────────────────────────────
+api_keys:
+  hunter: ""    # emails, company email patterns, verification
+  apollo: ""    # people search (titles, LinkedIn), org enrichment (funding, headcount, tech)
+  github: ""    # higher GitHub rate limit for org members & commit-email patterns
+  serper: ""    # Google results via serper.dev (more reliable than DuckDuckGo)
+  brave: ""     # Brave Search API
+
+search:
+  provider: "auto"          # auto | duckduckgo | serper | brave
+  min_interval_seconds: 2.0   # DuckDuckGo/Yahoo throttle bursts; add a Serper/Brave key for high volume
+
+# ──────────────────────────────────────────────────────────
+# Resume variants — chosen per role by explicit rules
+# `path` may be a .pdf, .docx, .typ, .md or .txt. Several variants can share ONE PDF and differ only in `focus`
+# (with generate_resume: true the LLM tailors that PDF's text with the focus and renders a new one-page PDF;
+#  with generate_resume: false the file is attached unchanged).
+# A rule matches when every condition it sets matches (each list = "any of"). The highest `priority` match wins;
+# with no match the `default: true` variant is used.
+# ──────────────────────────────────────────────────────────
+resumes:
+  - name: "research"
+    path: "resumes/my_resume.pdf"
+    priority: 40
+    focus: "Lead with ML/LLM work and analytical depth; research-style phrasing"
+    rules:
+      - title_any: ["research", "researcher", "research intern"]
+  - name: "aiml"
+    path: "resumes/my_resume.pdf"
+    priority: 30
+    focus: "Lead with LLM pipelines, ML coursework and AI projects"
+    rules:
+      - title_any: ["ai", "ml", "machine learning", "data scientist", "llm", "genai"]
+        title_none: ["research"]
+      - sectors: ["ai"]
+  - name: "fintech"
+    path: "resumes/my_resume.pdf"
+    priority: 20
+    focus: "Lead with payments/fraud/security projects, reliability and backend APIs"
+    rules:
+      - sectors: ["fintech", "trading", "insurtech", "crypto"]
+  - name: "backend"
+    path: "resumes/my_resume.pdf"
+    default: true
+    focus: "Lead with systems and backend engineering: Rust daemon, APIs, observability"
+
+# Your standout experiences, re-ordered per role (resume tailoring + emails). Tags drive relevance;
+# add a one-line `summary` with a concrete result to let emails and follow-ups mention it.
+highlights:
+  - name: "Jio internship"
+    summary: ""
+    tags: ["backend", "fintech", "payments", "scale", "systems", "java", "python"]
+  - name: "GSIH finalist"
+    summary: ""
+    tags: ["ai", "ml", "hackathon", "product", "llm"]
+  - name: "Team Ignition"
+    summary: ""
+    tags: ["systems", "embedded", "robotics", "hardware", "c++"]
+
+# ──────────────────────────────────────────────────────────
+# Outreach: tone, sending, follow-ups, tracking
+# ──────────────────────────────────────────────────────────
+outreach:
+  tone: "warm"                  # formal | warm | concise | enthusiastic | casual
+  persona_tones:
+    founder: "concise"
+    recruiter: "formal"
+  auto_send: false              # false = drafts only (you review & send); true = scheduled automatic sending
+  daily_send_limit: 20
+  min_minutes_between_sends: 4
+  send_window:
+    timezone: "Asia/Kolkata"
+    start_hour: 9
+    end_hour: 12
+    weekdays_only: true
+  followups:                    # follow-up #1 and #2, sent in the same thread if there is no reply
+    - after_days: 4
+    - after_days: 7
+  stop_on_reply: true
+  company_cooldown_days: 60     # don't start a new thread with a company contacted recently
+  check_gmail_history: true     # skip people you already emailed from Gmail (needs gmail.readonly)
+  classify_replies: true        # LLM labels replies: interview / positive / referral / not_interested / OOO
+  retry_on_bounce: true         # on bounce, mark address invalid and find the next best address
+  no_response_after_days: 10
+
+learning:
+  enabled: true           # learn reply rates by sector / persona / resume variant / funding stage
+  prior_reply_rate: 0.08
+  prior_strength: 10
+  min_samples: 5
+
+# ──────────────────────────────────────────────────────────
 # Prompt Customizations
+# Available placeholders are shown in {braces}; unknown ones are left untouched.
 # ──────────────────────────────────────────────────────────
 prompts:
   company_research: |
@@ -121,28 +287,51 @@ prompts:
     Base Resume Content:
     {base_resume_text}
 
+    Job description:
+    {job_description}
+
+    Order projects and experience so the most relevant come first, in this priority:
+    {highlights}
+
     Create a tailored version of the resume. Follow these guidelines:
-    - Reorder sections to highlight relevant experience first.
-    - Emphasize existing skills and bullet points in the Base Resume that match the job requirements (e.g. {tech_stack}).
+    - Reorder sections and projects to highlight relevant experience first.
+    - Rewrite bullet points (not just keywords) to emphasise existing work that matches the job requirements (e.g. {tech_stack}).
     - ONLY include or highlight technical skills and tools that are already present in the Base Resume.
     - DO NOT add any new languages, frameworks, databases, or tools to the tailored resume if they are not already in the Base Resume.
     - Improve wording and add relevant ATS keywords matching the job, but do not fabricate any projects, experience, or achievements. Ensure all information is 100% truthful and aligns with the Base Resume.
+    - Keep valid Typst that compiles with the same imports as the Base Resume.
     - Output reasoning and the modifications list.
 
   email_generation: |
-    Generate a highly personalized cold outreach email to {contact_name} ({contact_role}) at {company_name} for the position of {role_name}.
-    Use the following research insights:
+    Write a cold outreach email to {contact_name} ({contact_role}) at {company_name} about {role_name}.
+
+    What I know about them (use only this, never invent facts):
+    - Company: {company_description}
     - Product: {product_description}
-    - Tech Stack: {tech_stack}
-    - Engineering culture/launches: {recent_launches}
+    - Tech stack: {tech_stack}
+    - Recent news / launches: {recent_news}
+    - Job description: {job_description}
+    - About {contact_name}: {contact_background}
 
-    My Tailored Skills for this position:
-    {tailored_skills}
+    About me:
+    - Relevant skills: {tailored_skills}
+    - My highlights, most relevant first:
+    {highlights}
+    - My resume:
+    {resume_summary}
 
-    Guidelines:
-    - Write a short, punchy subject line.
-    - Write a concise, respectful, non-spammy email body.
-    - Reference specific aspects of their product or tech stack to show genuine interest.
-    - Explain how my experience aligns perfectly with their role based ONLY on the skills explicitly listed in my Tailored Skills. DO NOT invent or claim experience with any other languages, libraries, or infrastructures unless they are in my Tailored Skills list.
-    - Sign off the email using my name from user_identity.name. Under the name, include my LinkedIn and GitHub links from user_identity. DO NOT use placeholders like "[Your Name]", "[Candidate Name]", or "[My Name]".
-    - Ensure there are no placeholders of any kind in the final email.
+    Recipient-specific guidelines: {persona_guidelines}
+    Tone: {tone}.
+
+    Rules:
+    - Short, specific subject line (no clickbait).
+    - Open with one concrete, company-specific observation. If a recent launch or funding round is listed, reference it
+      (e.g. "I saw you recently launched ..."); if the contact's background is known and relevant, you may reference it.
+    - Connect at most two highlights to their product/stack with concrete results. Claim only skills from my resume.
+    - End with one clear, low-friction ask.
+    - Sign off with my name ({user_name}); my LinkedIn/GitHub links are appended automatically.
+    - No placeholders of any kind ("[Your Name]", "<Company>", etc.).
+
+  # Optional: custom follow-up prompt (default is built in). Placeholders: {initial_email}, {followup_count},
+  # {followup_1_days}, {followup_2_days}, plus everything available to email_generation.
+  followup_generation: ""

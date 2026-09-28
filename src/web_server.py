@@ -35,10 +35,13 @@ TERMINAL_STATES = (
     "Skipped",
     "Duplicate",
     "Salary Too Low",
+    "Low Score",
+    "Poor Fit",
     "Excluded Company",
     "Ghost Job",
     "Failed",
     "No Professional Email",
+    "Do Not Contact",
 )
 
 # Global status tracking for async actions
@@ -164,20 +167,22 @@ def get_db_status(db_path: str) -> dict[str, Any]:
         cur.execute(
             """
             SELECT COUNT(*) as filtered FROM applications
-            WHERE state IN ('Excluded Company', 'Salary Too Low', 'Ghost Job', 'Duplicate', 'No Professional Email', 'Skipped')
+            WHERE state IN ('Excluded Company', 'Salary Too Low', 'Low Score', 'Poor Fit', 'Ghost Job', 'Duplicate',
+                            'No Professional Email', 'Skipped', 'Do Not Contact')
             """
         )
         filtered = cur.fetchone()["filtered"]
 
         # Active running applications
+        placeholders = ",".join("?" for _ in TERMINAL_STATES)
         cur.execute(
-            """
+            f"""
             SELECT a.id, a.run_id, a.current_stage, a.state, a.updated_at, a.score,
                    j.title as job_title, c.name as company_name
             FROM applications a
             JOIN jobs j ON a.job_id = j.id
             JOIN companies c ON j.company_id = c.id
-            WHERE a.state NOT IN (?, ?, ?, ?, ?, ?, ?, ?)
+            WHERE a.state NOT IN ({placeholders})
             ORDER BY a.updated_at DESC
             """,
             TERMINAL_STATES,
@@ -307,6 +312,43 @@ def get_all_applications(db_path: str) -> list[dict[str, Any]]:
         return []
 
 
+def _loads(value: Any) -> Any:
+    if isinstance(value, str):
+        with contextlib.suppress(Exception):
+            return json.loads(value)
+    return value
+
+
+def get_funnel(db_path: str, campaign_id: int | None = None) -> dict[str, Any]:
+    """Conversion funnel + email verification stats for the dashboard."""
+    if not os.path.exists(db_path):
+        return {"funnel": [], "extra": {}, "verification": {}}
+    from src.analytics.funnel import compute_funnel, email_verification_stats
+    from src.db.session import get_session_factory
+
+    session = get_session_factory(db_path)()
+    try:
+        data = compute_funnel(session, campaign_id)
+        data["verification"] = email_verification_stats(session)
+        return data
+    finally:
+        session.close()
+
+
+def get_campaigns(db_path: str) -> list[dict[str, Any]]:
+    if not os.path.exists(db_path):
+        return []
+    from src.db.models import Campaign
+    from src.db.session import get_session_factory
+    from src.pipeline.campaign import campaign_progress
+
+    session = get_session_factory(db_path)()
+    try:
+        return [campaign_progress(session, c) for c in session.query(Campaign).order_by(Campaign.id.desc()).all()]
+    finally:
+        session.close()
+
+
 def get_application_details(db_path: str, app_id: int) -> dict[str, Any] | None:
     """Retrieve complete application inspection details."""
     if not os.path.exists(db_path):
@@ -320,9 +362,16 @@ def get_application_details(db_path: str, app_id: int) -> dict[str, Any] | None:
             """
             SELECT a.id, a.run_id, a.current_stage, a.state, a.score, a.score_breakdown,
                    a.tailored_resume_path, a.created_at, a.updated_at,
+                   a.outreach_status, a.persona, a.response_probability, a.reply_category, a.reply_summary,
                    j.title as job_title, j.location as job_location, j.salary as job_salary, j.description as job_description,
+                   j.source as job_source,
                    c.name as company_name, c.domain as company_domain, c.industry as company_industry, c.employee_count as company_employees,
-                   ct.name as contact_name, ct.role as contact_role, ct.email as contact_email
+                   c.sector as company_sector, c.funding_stage as company_funding, c.hiring_status as company_hiring,
+                   c.fit_score as company_fit, c.recent_news as company_news, c.tech_stack as company_stack,
+                   ct.name as contact_name, ct.role as contact_role, ct.email as contact_email,
+                   ct.role_category as contact_category, ct.email_status as contact_email_status,
+                   ct.email_confidence as contact_email_confidence, ct.source as contact_source,
+                   ct.linkedin_url as contact_linkedin
             FROM applications a
             JOIN jobs j ON a.job_id = j.id
             JOIN companies c ON j.company_id = c.id
@@ -344,25 +393,40 @@ def get_application_details(db_path: str, app_id: int) -> dict[str, Any] | None:
             except Exception:
                 breakdown = app_row["score_breakdown"]
 
-        # Fetch latest email
+        # Fetch the email sequence (initial email first, then follow-ups)
         cur.execute(
             """
-            SELECT subject, body, gmail_draft_id, status, scheduled_at, created_at
-            FROM emails WHERE application_id = ? ORDER BY id DESC LIMIT 1
+            SELECT subject, body, gmail_draft_id, status, scheduled_at, created_at, sequence_step, sent_at, tone, persona
+            FROM emails WHERE application_id = ?
+            ORDER BY COALESCE(sequence_step, 0) ASC, id DESC
             """,
             (app_id,),
         )
-        email_row = cur.fetchone()
-        email_info = None
-        if email_row:
-            email_info = {
-                "subject": email_row["subject"],
-                "body": email_row["body"],
-                "gmail_draft_id": email_row["gmail_draft_id"],
-                "status": email_row["status"],
-                "scheduled_at": str(email_row["scheduled_at"]) if email_row["scheduled_at"] else None,
-                "created_at": str(email_row["created_at"]),
-            }
+        sequence = []
+        for email_row in cur.fetchall():
+            sequence.append(
+                {
+                    "step": email_row["sequence_step"] or 0,
+                    "subject": email_row["subject"],
+                    "body": email_row["body"],
+                    "gmail_draft_id": email_row["gmail_draft_id"],
+                    "status": email_row["status"],
+                    "scheduled_at": str(email_row["scheduled_at"]) if email_row["scheduled_at"] else None,
+                    "sent_at": str(email_row["sent_at"]) if email_row["sent_at"] else None,
+                    "tone": email_row["tone"],
+                    "persona": email_row["persona"],
+                    "created_at": str(email_row["created_at"]),
+                }
+            )
+        email_info = sequence[0] if sequence else None
+
+        cur.execute(
+            "SELECT event_type, timestamp, details FROM outreach_events WHERE application_id = ? ORDER BY id DESC",
+            (app_id,),
+        )
+        events = [
+            {"type": e["event_type"], "timestamp": str(e["timestamp"]), "details": e["details"]} for e in cur.fetchall()
+        ]
 
         # Fetch latest resume version
         cur.execute(
@@ -426,18 +490,36 @@ def get_application_details(db_path: str, app_id: int) -> dict[str, Any] | None:
                 "salary": app_row["job_salary"] or "N/A",
                 "description": app_row["job_description"] or "",
             },
+            "outreach_status": app_row["outreach_status"],
+            "persona": app_row["persona"],
+            "response_probability": app_row["response_probability"],
+            "reply": {"category": app_row["reply_category"], "summary": app_row["reply_summary"]},
             "company": {
                 "name": app_row["company_name"],
                 "domain": app_row["company_domain"] or "N/A",
                 "industry": app_row["company_industry"] or "N/A",
                 "employee_count": app_row["company_employees"] or "N/A",
+                "sector": app_row["company_sector"],
+                "funding_stage": app_row["company_funding"],
+                "hiring_status": app_row["company_hiring"],
+                "fit_score": app_row["company_fit"],
+                "recent_news": _loads(app_row["company_news"]),
+                "tech_stack": _loads(app_row["company_stack"]),
             },
             "contact": {
                 "name": app_row["contact_name"] or "N/A",
                 "role": app_row["contact_role"] or "N/A",
                 "email": app_row["contact_email"] or "N/A",
+                "role_category": app_row["contact_category"],
+                "email_status": app_row["contact_email_status"],
+                "email_confidence": app_row["contact_email_confidence"],
+                "source": app_row["contact_source"],
+                "linkedin_url": app_row["contact_linkedin"],
             },
+            "job_source": app_row["job_source"],
             "email": email_info,
+            "email_sequence": sequence,
+            "events": events,
             "resume": resume_info,
             "history": history_info,
         }
@@ -453,7 +535,15 @@ def get_companies(db_path: str) -> list[dict[str, Any]]:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         cur = conn.cursor()
-        cur.execute("SELECT id, name, domain, employee_count, industry, created_at FROM companies ORDER BY name ASC LIMIT 200")
+        cur.execute(
+            """
+            SELECT id, name, domain, employee_count, industry, created_at, sector, funding_stage, hiring_status,
+                   fit_score, response_probability, status, source
+            FROM companies
+            ORDER BY COALESCE(fit_score, 0) * (0.5 + COALESCE(response_probability, 0.08) * 5) DESC, name ASC
+            LIMIT 500
+            """
+        )
         rows = cur.fetchall()
         res = [
             {
@@ -463,6 +553,13 @@ def get_companies(db_path: str) -> list[dict[str, Any]]:
                 "employee_count": r["employee_count"] or "N/A",
                 "industry": r["industry"] or "N/A",
                 "created_at": str(r["created_at"]),
+                "sector": r["sector"] or "N/A",
+                "funding_stage": r["funding_stage"] or "N/A",
+                "hiring_status": r["hiring_status"] or "N/A",
+                "fit_score": round(r["fit_score"], 2) if r["fit_score"] is not None else None,
+                "response_probability": r["response_probability"],
+                "status": r["status"] or "N/A",
+                "source": r["source"] or "N/A",
             }
             for r in rows
         ]
@@ -482,10 +579,11 @@ def get_contacts(db_path: str) -> list[dict[str, Any]]:
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT ct.id, ct.name, ct.role, ct.email, ct.linkedin_url, c.name as company_name
+            SELECT ct.id, ct.name, ct.role, ct.email, ct.linkedin_url, c.name as company_name,
+                   ct.role_category, ct.email_status, ct.source, ct.rank_score
             FROM contacts ct
             JOIN companies c ON ct.company_id = c.id
-            ORDER BY ct.id DESC LIMIT 200
+            ORDER BY ct.id DESC LIMIT 500
             """
         )
         rows = cur.fetchall()
@@ -497,6 +595,10 @@ def get_contacts(db_path: str) -> list[dict[str, Any]]:
                 "role": r["role"],
                 "email": r["email"] or "N/A",
                 "linkedin_url": r["linkedin_url"] or "N/A",
+                "role_category": r["role_category"] or "N/A",
+                "email_status": r["email_status"] or "N/A",
+                "source": r["source"] or "N/A",
+                "rank_score": r["rank_score"],
             }
             for r in rows
         ]
@@ -626,6 +728,16 @@ def execute_pipeline_action_thread(
             else:
                 run_id = runner.run(max_stage=12)
                 msg = f"Pipeline run completed for {run_id}!"
+        elif action_type in ("outreach", "daily"):
+            from src.pipeline.runner import PipelineRunner
+
+            runner = PipelineRunner(config_path=config_path)
+            if action_type == "outreach":
+                summary = runner.run_outreach_cycle()
+                msg = f"Outreach cycle done: {summary or 'Gmail not authorized'}"
+            else:
+                runner.run_daily()
+                msg = "Daily run completed!"
         elif action_type == "clean_invalid":
             from src.utils.cleaner import clean_invalid_emails_and_states
 
@@ -718,6 +830,22 @@ class StatusWidgetRequestHandler(BaseHTTPRequestHandler):
             self._send_json(jobs_data)
             return
 
+        if path == "/api/funnel":
+            campaign_str = query_params.get("campaign", [None])[0]
+            campaign_id = int(campaign_str) if campaign_str and campaign_str.isdigit() else None
+            try:
+                self._send_json(get_funnel(self.db_path, campaign_id))
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/api/campaigns":
+            try:
+                self._send_json(get_campaigns(self.db_path))
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
         if path == "/api/config":
             content = ""
             if os.path.exists(self.config_path):
@@ -763,6 +891,8 @@ class StatusWidgetRequestHandler(BaseHTTPRequestHandler):
             "/api/actions/retry",
             "/api/actions/clean_invalid",
             "/api/actions/export",
+            "/api/actions/outreach",
+            "/api/actions/daily",
         ):
             action_type = path.split("/")[-1]
             runner_stat = check_runner_active()
@@ -879,6 +1009,10 @@ def run_widget_server(
     host: str = "127.0.0.1",
 ) -> None:
     """Launch HTTP server serving the dark mode job status widget & web dashboard."""
+    with contextlib.suppress(Exception):
+        from src.db.session import init_db
+
+        init_db(db_path)  # make sure new columns/tables exist before serving
     StatusWidgetRequestHandler.db_path = db_path
     StatusWidgetRequestHandler.config_path = config_path
     server_address = (host, port)
