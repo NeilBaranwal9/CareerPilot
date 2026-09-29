@@ -1,18 +1,28 @@
 """
-Contact discovery from multiple sources, role classification and persona-aware ranking.
+Contact discovery from multiple sources (LinkedIn-free by default), role classification and persona-aware ranking.
 
-Sources:
-- linkedin_search : public LinkedIn profile titles/snippets from search results (profiles are never scraped)
-- team_page       : the company's own about/team/leadership/contact pages (plus any emails printed there)
-- press           : press releases, interviews and news quoting founders/CTOs/engineering leaders
-- github          : public members of the company's GitHub org, and commit emails for pattern inference
-- hunter          : Hunter.io domain search (people, positions, emails, company email pattern)
-- apollo          : Apollo.io people search (titles, LinkedIn, employment history)
+Sources, in priority order:
+- team_page   : team / leadership / about / people pages found by following the company homepage's own links
+- blog        : engineering and product blogs (post authors and their roles)
+- press       : press releases, interviews and conference-speaker pages that name company leaders
+- github      : public members of the company's GitHub org, and commit emails for pattern inference
+- theorg      : The Org public org-chart pages (via search results)
+- crunchbase  : Crunchbase person profiles (via search results; the site itself blocks scrapers)
+- wellfound   : Wellfound company team pages (via search results)
+- hunter/apollo: optional APIs when keys are configured
+- linkedin_search: only when `discovery.allow_linkedin` is true (LinkedIn blocks automated access)
+
+Anti-hallucination: any person proposed by the LLM must appear by name in the fetched text, otherwise dropped.
+Every contact keeps the URL where it was found and a source-based confidence.
 """
 
 import logging
 import re
+import unicodedata
+import urllib.parse
 from dataclasses import dataclass, field
+
+from bs4 import BeautifulSoup
 
 from src.config import AppConfig
 from src.db.models import Company
@@ -34,19 +44,36 @@ PERSONA_SEARCH_TERMS: dict[str, str] = {
     "cto": '(CTO OR "chief technology officer")',
     "vp_engineering": '("head of engineering" OR "VP engineering" OR "director of engineering")',
     "tech_lead": '"tech lead"',
+    "product_manager": '"product manager"',
 }
 
-TEAM_PAGE_PATHS = ["/about", "/about-us", "/team", "/our-team", "/company", "/leadership", "/people", "/contact"]
+# Config persona names -> role categories produced by classify_role
+PERSONA_ALIASES: dict[str, str] = {
+    "director_engineering": "vp_engineering",
+    "head_of_engineering": "vp_engineering",
+    "staff_engineer": "tech_lead",
+    "talent_acquisition": "recruiter",
+    "hr": "recruiter",
+    "head_of_product": "product_lead",
+}
+
+TEAM_LINK_WORDS = ("team", "leadership", "about", "people", "management", "founders", "our-story", "company", "who-we-are")
+BLOG_LINK_WORDS = ("blog", "engineering", "tech-blog", "insights", "stories")
+TEAM_PAGE_PATHS = ["/about", "/about-us", "/team", "/our-team", "/leadership", "/company", "/people", "/contact"]
 
 SOURCE_CONFIDENCE = {
+    "provided": 0.95,
     "hunter": 0.8,
     "apollo": 0.8,
-    "team_page": 0.75,
+    "team_page": 0.8,
+    "theorg": 0.7,
     "linkedin_search": 0.7,
-    "github": 0.6,
-    "press": 0.55,
+    "blog": 0.65,
+    "press": 0.6,
+    "crunchbase": 0.6,
+    "wellfound": 0.6,
+    "github": 0.55,
     "web_search": 0.5,
-    "provided": 0.95,
     "fallback": 0.2,
 }
 
@@ -77,6 +104,12 @@ class ContactDiscoveryResult:
     email_pattern: str | None = None
     accept_all: bool | None = None
     context_text: str = ""
+    sources_tried: dict[str, int] = field(default_factory=dict)  # source -> contacts found
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
 def looks_like_person_name(name: str) -> bool:
@@ -90,6 +123,39 @@ def looks_like_person_name(name: str) -> bool:
 
 def _norm(value: str) -> str:
     return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def _fold(value: str) -> str:
+    return unicodedata.normalize("NFKD", value).encode("ascii", "ignore").decode("ascii").lower()
+
+
+def name_in_text(name: str, text: str) -> bool:
+    """True when every meaningful token of the name appears in the text (accent/case-insensitive)."""
+    folded = _fold(text)
+    tokens = [t for t in re.findall(r"[a-z]+", _fold(name)) if len(t) > 1]
+    return bool(tokens) and all(re.search(rf"\b{re.escape(t)}\b", folded) for t in tokens)
+
+
+def person_key(name: str) -> str:
+    """First + last name, ignoring middle names/initials: 'Ramkumar M Venkatesan' == 'Ramkumar Venkatesan'."""
+    tokens = [t for t in re.findall(r"[a-z]+", _fold(name)) if len(t) > 1]
+    if len(tokens) >= 2:
+        return str(tokens[0]) + str(tokens[-1])
+    return "".join(tokens)
+
+
+def normalize_personas(personas: list[str]) -> list[str]:
+    out: list[str] = []
+    for p in personas:
+        mapped = PERSONA_ALIASES.get(p, p)
+        if mapped not in out:
+            out.append(mapped)
+    return out
+
+
+def _same_site(url: str, domain: str) -> bool:
+    host = urllib.parse.urlparse(url).netloc.lower().replace("www.", "")
+    return host == domain or host.endswith("." + domain)
 
 
 def parse_linkedin_result(result: dict[str, str], company_name: str) -> ContactCandidate | None:
@@ -122,25 +188,227 @@ def parse_linkedin_result(result: dict[str, str], company_name: str) -> ContactC
     )
 
 
-def _llm_extract(llm: BaseLLMProvider, company: Company, text: str, source: str) -> list[ContactCandidate]:
+def parse_theorg_result(result: dict[str, str], company_name: str) -> ContactCandidate | None:
+    """Parses The Org results: 'Harshil Mathur - CEO at Razorpay | The Org'."""
+    url = result.get("url", "")
+    if "theorg.com" not in url:
+        return None
+    title = re.split(r"\s*\|\s*The Org", result.get("title", ""), flags=re.IGNORECASE)[0]
+    match = re.match(r"^(?P<name>[^-–—|]+?)\s+[-–—]\s+(?P<role>.+?)(?:\s+(?:at|@)\s+(?P<company>.+))?$", title)
+    if not match:
+        return None
+    name, role = match.group("name").strip(), match.group("role").strip()
+    company = match.group("company") or result.get("snippet", "")
+    if _norm(company_name) not in _norm(company + title) or not looks_like_person_name(name):
+        return None
+    return ContactCandidate(name=name, title=role, source="theorg", source_url=url.split("?")[0],
+                            background=(result.get("snippet") or "")[:300] or None)
+
+
+def _llm_extract(
+    llm: BaseLLMProvider, company: Company, chunks: list[tuple[str, str]], source: str, focus: str = ""
+) -> list[ContactCandidate]:
+    """
+    Asks the (local) LLM for people named in the chunks, then keeps only names that literally appear in the text
+    and records the URL of the chunk where each name was found.
+    """
+    chunks = [(url, text) for url, text in chunks if text.strip()]
+    if not chunks:
+        return []
+    joined = "\n".join(f"\n--- SOURCE: {url} ---\n{text}" for url, text in chunks)[:11000]
     prompt = (
-        f"Identify real people who work at {company.name} (engineering managers, tech leads, recruiters, "
-        f"founders, CTO, hiring managers) from the following text. Only include people explicitly named in the "
-        f"text as working at {company.name}; include their exact role and a one-line background if present.\n\n{text}"
+        f"List the real people who work at {company.name} and are named in the text below{focus}. For each, give "
+        f"their exact name, their role/title as written, a LinkedIn URL only if one is printed in the text, and a "
+        f"one-line background if present. Only include people explicitly described as working at {company.name}. "
+        f"Do not guess or invent anyone.\n{joined}"
     )
     response = llm.generate_json(prompt, ContactListResponse)
     assert isinstance(response, ContactListResponse)
-    return [
-        ContactCandidate(
-            name=c.name,
-            title=c.role,
-            source=source,
-            linkedin_url=c.linkedin_url if c.linkedin_url and "linkedin.com/in/" in c.linkedin_url else None,
-            background=c.background,
+    found: list[ContactCandidate] = []
+    for c in response.contacts:
+        if not c.name or not name_in_text(c.name, joined):
+            if c.name:
+                logger.info(f"Dropped '{c.name}' for {company.name}: name not present in the {source} text")
+            continue
+        url = next((u for u, text in chunks if name_in_text(c.name, text)), chunks[0][0])
+        linkedin = c.linkedin_url if c.linkedin_url and "linkedin.com/in/" in c.linkedin_url and c.linkedin_url in joined else None
+        found.append(
+            ContactCandidate(name=c.name.strip(), title=c.role or "Employee", source=source, source_url=url,
+                             linkedin_url=linkedin, background=c.background)
         )
-        for c in response.contacts
-        if c.name
+    return found
+
+
+def _fetch_text(browser: BrowserProvider, url: str, limit: int = 3000) -> tuple[str, str]:
+    """(raw_html, text) or ("", "") on failure."""
+    try:
+        html = browser.fetch_page(url, use_playwright=False)
+    except Exception as e:
+        logger.debug(f"Could not fetch {url}: {e}")
+        return "", ""
+    return html, browser.extract_text(html)[:limit]
+
+
+def discover_site_links(browser: BrowserProvider, company: Company) -> tuple[list[str], list[str]]:
+    """Team-like and blog-like links from the company homepage (same site only)."""
+    if not company.domain:
+        return [], []
+    html, _text = _fetch_text(browser, f"https://{company.domain}")
+    if not html:
+        return [], []
+    soup = BeautifulSoup(html, "html.parser")
+    team: list[str] = []
+    blogs: list[str] = []
+    for a in soup.find_all("a", href=True):
+        href = urllib.parse.urljoin(f"https://{company.domain}/", str(a.get("href", "")))
+        if not href.startswith("http") or not _same_site(href, company.domain):
+            continue
+        href = href.split("#")[0].rstrip("/")
+        label = f"{urllib.parse.urlparse(href).path} {a.get_text(' ', strip=True)}".lower()
+        host = urllib.parse.urlparse(href).netloc.lower()
+        if any(w in label for w in TEAM_LINK_WORDS) and href not in team and "career" not in label:
+            team.append(href)
+        elif (any(w in label for w in BLOG_LINK_WORDS) or host.startswith(("blog.", "engineering.", "tech."))) and href not in blogs:
+            blogs.append(href)
+    return team[:5], blogs[:3]
+
+
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+
+
+def from_team_pages(
+    browser: BrowserProvider, llm: BaseLLMProvider, company: Company, links: list[str] | None = None
+) -> tuple[list[ContactCandidate], str, list[str]]:
+    if not company.domain:
+        return [], "", []
+    urls = list(links or []) or [f"https://{company.domain}{p}" for p in TEAM_PAGE_PATHS]
+    chunks: list[tuple[str, str]] = []
+    emails: list[str] = []
+    for url in urls[:6]:
+        html, text = _fetch_text(browser, url, 2800)
+        if not html:
+            continue
+        emails.extend(e for e in extract_emails_from_text(html, company.domain) if e not in emails)
+        chunks.append((url, text))
+        if sum(len(t) for _u, t in chunks) > 9000:
+            break
+    if not chunks:
+        return [], "", emails
+    try:
+        candidates = _llm_extract(llm, company, chunks, "team_page", " (founders, leadership, team members)")
+    except Exception as e:
+        logger.warning(f"Team page contact extraction failed for {company.name}: {e}")
+        candidates = []
+    return candidates, "\n".join(t for _u, t in chunks), emails
+
+
+def from_blogs(
+    browser: BrowserProvider, llm: BaseLLMProvider, company: Company, links: list[str] | None = None
+) -> list[ContactCandidate]:
+    """Engineering/product blog authors (index page plus up to two recent posts)."""
+    if not company.domain:
+        return []
+    candidates_urls = list(links or []) + [
+        f"https://{company.domain}/blog", f"https://engineering.{company.domain}", f"https://blog.{company.domain}",
+        f"https://{company.domain}/engineering", f"https://tech.{company.domain}",
     ]
+    chunks: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for index_url in candidates_urls:
+        if index_url in seen or len(chunks) >= 3:
+            continue
+        seen.add(index_url)
+        html, text = _fetch_text(browser, index_url, 2500)
+        if not html:
+            continue
+        chunks.append((index_url, text))
+        soup = BeautifulSoup(html, "html.parser")
+        posts = []
+        for a in soup.find_all("a", href=True):
+            href = urllib.parse.urljoin(index_url + "/", str(a.get("href", ""))).split("#")[0]
+            path = urllib.parse.urlparse(href).path
+            if _same_site(href, company.domain) and href not in seen and path.count("/") >= 2 and len(path) > 12:
+                posts.append(href)
+        for post in posts[:2]:
+            seen.add(post)
+            _html, post_text = _fetch_text(browser, post, 1800)
+            if post_text:
+                chunks.append((post, post_text))
+        break  # one blog is enough
+    if not chunks:
+        return []
+    try:
+        return _llm_extract(llm, company, chunks, "blog", " as blog post authors (with their job titles)")
+    except Exception as e:
+        logger.warning(f"Blog contact extraction failed for {company.name}: {e}")
+        return []
+
+
+def _search_chunks(
+    browser: BrowserProvider, query: str, fetch: int = 1, num: int = 4, snippets_only_site: bool = False
+) -> list[tuple[str, str]]:
+    """
+    Search results as (url, text) chunks. For sites that block scrapers (Crunchbase, Wellfound) we keep their
+    results but read only the title/snippet (never fetch the page).
+    """
+    chunks: list[tuple[str, str]] = []
+    results = (
+        browser.search_google(query, num_results=num, include_blocked=True)
+        if snippets_only_site
+        else browser.search_google(query, num_results=num)
+    )
+    for i, r in enumerate(results):
+        url = r.get("url", "")
+        if not url or "example.com/search" in url:
+            continue
+        text = f"{r.get('title', '')}\n{r.get('snippet', '')}"
+        if "linkedin.com" in url:
+            continue  # LinkedIn is never used as a source; profile URLs are only kept when printed elsewhere
+        if i < fetch:
+            _html, page_text = _fetch_text(browser, url, 2200)
+            text += "\n" + page_text
+        chunks.append((url, text))
+    return chunks
+
+
+def from_web_sources(
+    browser: BrowserProvider, llm: BaseLLMProvider, company: Company, sources: list[str]
+) -> tuple[list[ContactCandidate], str]:
+    """Press, conference speakers, The Org, Crunchbase and Wellfound — one LLM extraction over all snippets."""
+    name = company.name
+    found: list[ContactCandidate] = []
+    chunks: list[tuple[str, str]] = []
+    if "press" in sources:
+        chunks += _search_chunks(browser, f'"{name}" (founder OR CTO OR "head of engineering" OR "engineering manager" OR "head of product") interview OR announces OR said', fetch=2)
+        chunks += _search_chunks(browser, f'"{name}" ("head of talent" OR "talent acquisition" OR recruiter OR "people team")', fetch=0)
+        chunks += _search_chunks(browser, f'"{name}" speaker conference (engineering OR product OR fintech)', fetch=1)
+    if "theorg" in sources:
+        for r in browser.search_google(f'site:theorg.com "{name}"', num_results=8, include_blocked=True):
+            cand = parse_theorg_result(r, name)
+            if cand:
+                found.append(cand)
+            elif "theorg.com" in r.get("url", ""):
+                chunks.append((r["url"], f"{r.get('title', '')}\n{r.get('snippet', '')}"))
+    if "crunchbase" in sources:
+        chunks += _search_chunks(browser, f'site:crunchbase.com/person "{name}"', fetch=0, num=6, snippets_only_site=True)
+    if "wellfound" in sources:
+        chunks += _search_chunks(
+            browser, f'site:wellfound.com "{name}" founder OR team OR "head of"', fetch=0, num=5, snippets_only_site=True
+        )
+    if chunks:
+        try:
+            for cand in _llm_extract(llm, company, chunks, "press"):
+                url = cand.source_url or ""
+                cand.source = (
+                    "crunchbase" if "crunchbase.com" in url else "wellfound" if "wellfound.com" in url
+                    else "theorg" if "theorg.com" in url else "press"
+                )
+                found.append(cand)
+        except Exception as e:
+            logger.warning(f"Web-source contact extraction failed for {name}: {e}")
+    return found, "\n".join(t for _u, t in chunks)
 
 
 def from_linkedin_search(browser: BrowserProvider, company: Company, personas: list[str]) -> list[ContactCandidate]:
@@ -157,68 +425,12 @@ def from_linkedin_search(browser: BrowserProvider, company: Company, personas: l
     return found
 
 
-def from_team_pages(
-    browser: BrowserProvider, llm: BaseLLMProvider, company: Company
-) -> tuple[list[ContactCandidate], str, list[str]]:
-    if not company.domain:
-        return [], "", []
-    text = ""
-    emails: list[str] = []
-    for path in TEAM_PAGE_PATHS:
-        url = f"https://{company.domain}{path}"
-        try:
-            page = browser.fetch_page(url, use_playwright=False)
-        except Exception:
-            continue
-        emails.extend(e for e in extract_emails_from_text(page, company.domain) if e not in emails)
-        text += f"\n--- {url} ---\n" + browser.extract_text(page)[:2500]
-        if len(text) > 7000:
-            break
-    if not text:
-        return [], "", emails
-    try:
-        candidates = _llm_extract(llm, company, text, "team_page")
-    except Exception as e:
-        logger.warning(f"Team page contact extraction failed for {company.name}: {e}")
-        candidates = []
-    return candidates, text, emails
-
-
-def from_press_and_web(
-    browser: BrowserProvider, llm: BaseLLMProvider, company: Company
-) -> tuple[list[ContactCandidate], str]:
-    queries = [
-        (f"'{company.name}' (CTO OR 'Engineering Manager' OR 'Tech Lead' OR 'Hiring Manager') linkedin contacts", "web_search"),
-        (f'"{company.name}" founder OR CTO OR "head of engineering" interview OR announces OR said', "press"),
-    ]
-    candidates: list[ContactCandidate] = []
-    all_text = ""
-    for query, source in queries:
-        text = ""
-        for r in browser.search_google(query, num_results=3):
-            if "example.com/search" in r.get("url", ""):
-                continue
-            text += f"\n--- {r.get('title', '')} ({r.get('url', '')}) ---\n{r.get('snippet', '')}\n"
-            try:
-                page = browser.fetch_page(r["url"], use_playwright=False)
-                text += browser.extract_text(page)[:2000]
-            except Exception as e:
-                logger.debug(f"Error scraping {r.get('url')}: {e}")
-        if not text.strip():
-            continue
-        all_text += text
-        try:
-            candidates.extend(_llm_extract(llm, company, text, source))
-        except Exception as e:
-            logger.warning(f"{source} contact extraction failed for {company.name}: {e}")
-    return candidates, all_text
-
-
 def _person_to_candidate(p: PersonRecord) -> ContactCandidate:
     return ContactCandidate(
         name=p.name,
         title=p.title or "Employee",
         source=p.source,
+        source_url=p.github_url or p.linkedin_url,
         linkedin_url=p.linkedin_url,
         github_url=p.github_url,
         email=p.email,
@@ -227,10 +439,15 @@ def _person_to_candidate(p: PersonRecord) -> ContactCandidate:
     )
 
 
+# ---------------------------------------------------------------------------
+# Merge & rank
+# ---------------------------------------------------------------------------
+
+
 def merge_contact_candidates(candidates: list[ContactCandidate]) -> list[ContactCandidate]:
     merged: dict[str, ContactCandidate] = {}
     for cand in candidates:
-        key = _norm(cand.name)
+        key = person_key(cand.name)
         if not key:
             continue
         cand.confidence = max(cand.confidence, SOURCE_CONFIDENCE.get(cand.source, 0.5))
@@ -254,15 +471,53 @@ def merge_contact_candidates(candidates: list[ContactCandidate]) -> list[Contact
     return list(merged.values())
 
 
+# Who to ask about internships in each target role family (company-level inquiries), most suitable first.
+FAMILY_PERSONAS: dict[str, list[str]] = {
+    "product": ["product_lead", "product_manager", "recruiter"],
+    "business": ["product_lead", "product_manager", "recruiter"],
+    "data": ["data_lead", "product_lead", "product_manager", "recruiter"],
+    "qa": ["qa_lead", "engineering_manager", "recruiter"],
+    "software": ["engineering_manager", "vp_engineering", "hiring_manager", "recruiter"],
+    "ai_ml": ["data_lead", "engineering_manager", "vp_engineering", "recruiter"],
+}
+EARLY_STAGE_HEADCOUNT = 50
+
+
+def personas_for_families(families: list[str], company: Company) -> list[str]:
+    """
+    Recipient preference for a company-level inquiry, derived from your target role families (in your order):
+    product/data -> product lead / PM / data lead / recruiter, engineering -> EM / head of engineering / recruiter,
+    QA -> QA lead / EM / recruiter; founders first at early-stage startups.
+    """
+    preferred: list[str] = []
+    headcount = effective_headcount(company.employee_count, company.funding_stage)
+    if (headcount is not None and headcount <= EARLY_STAGE_HEADCOUNT) or company.funding_stage in ("pre_seed", "seed"):
+        preferred.append("founder")
+    for family in families:
+        for persona in FAMILY_PERSONAS.get(family, []):
+            if persona not in preferred:
+                preferred.append(persona)
+    for persona in ("hiring_manager", "recruiter"):
+        if persona not in preferred:
+            preferred.append(persona)
+    return preferred
+
+
 def rank_contacts(
-    candidates: list[ContactCandidate], company: Company, config: AppConfig, stats: OutcomeStats | None = None
+    candidates: list[ContactCandidate],
+    company: Company,
+    config: AppConfig,
+    stats: OutcomeStats | None = None,
+    preferred_personas: list[str] | None = None,
 ) -> list[ContactCandidate]:
     """
     Orders contacts by who is most likely to reply and able to help:
     persona preference (size-aware in 'auto' mode, strict in 'ordered' mode) x source confidence x reachability,
-    scaled by what has historically worked for you.
+    scaled by what has historically worked for you. `preferred_personas` (company-level inquiries) boosts, in 'auto'
+    mode, those of your configured personas that suit your target roles; 'ordered' keeps your explicit order.
     """
-    personas = config.contacts.personas
+    personas = normalize_personas(config.contacts.personas)
+    preferred = [p for p in normalize_personas(preferred_personas or []) if p in personas]
     for cand in candidates:
         if config.contacts.persona_strategy == "ordered":
             idx = personas.index(cand.role_category) if cand.role_category in personas else len(personas) + 2
@@ -273,6 +528,8 @@ def rank_contacts(
             headcount = effective_headcount(company.employee_count, company.funding_stage)
             persona_weight = persona_multiplier(cand.role_category, headcount, stats)
             persona_weight *= 1.1 if cand.role_category in personas else 0.7
+            if cand.role_category in preferred:
+                persona_weight *= max(1.0, 1.4 - 0.08 * preferred.index(cand.role_category))
         reach = 1.15 if cand.email else 1.0
         reach *= 1.05 if cand.linkedin_url else 1.0
         cand.rank_score = round(persona_weight * (0.5 + 0.5 * cand.confidence) * reach, 4)
@@ -286,69 +543,89 @@ def rank_contacts(
     return sorted(candidates, key=lambda c: c.rank_score, reverse=True)
 
 
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
+
+
 def discover_contacts(
     config: AppConfig, llm: BaseLLMProvider, browser: BrowserProvider, company: Company
 ) -> ContactDiscoveryResult:
     sources = config.contacts.sources
-    personas = config.contacts.personas
+    personas = normalize_personas(config.contacts.personas)
     result = ContactDiscoveryResult()
     raw: list[ContactCandidate] = []
     context_parts: list[str] = []
 
-    def guard(name: str) -> bool:
-        return name in sources
+    def add(source: str, found: list[ContactCandidate]) -> None:
+        raw.extend(found)
+        result.sources_tried[source] = result.sources_tried.get(source, 0) + len(found)
 
-    if guard("hunter") and company.domain and config.api_keys.get("hunter"):
+    if "hunter" in sources and company.domain and config.api_keys.get("hunter"):
         try:
             intel = HunterClient(browser, config.api_keys.get("hunter")).domain_search(company.domain)
-            raw.extend(_person_to_candidate(p) for p in intel.people)
+            add("hunter", [_person_to_candidate(p) for p in intel.people])
             result.email_samples.extend(intel.samples)
             result.email_pattern = intel.pattern or result.email_pattern
             result.accept_all = intel.accept_all
         except Exception as e:
             logger.warning(f"Hunter domain search failed for {company.domain}: {e}")
 
-    if guard("apollo") and company.domain and config.api_keys.get("apollo"):
+    if "apollo" in sources and company.domain and config.api_keys.get("apollo"):
         try:
-            people = ApolloClient(browser, config.api_keys.get("apollo")).search_people(company.domain, personas)
-            raw.extend(_person_to_candidate(p) for p in people)
+            add("apollo", [_person_to_candidate(p) for p in ApolloClient(browser, config.api_keys.get("apollo")).search_people(company.domain, personas)])
         except Exception as e:
             logger.warning(f"Apollo people search failed for {company.domain}: {e}")
 
-    if guard("linkedin_search"):
+    team_links: list[str] = []
+    blog_links: list[str] = []
+    if ("team_page" in sources or "blog" in sources) and company.domain:
         try:
-            raw.extend(from_linkedin_search(browser, company, personas))
+            team_links, blog_links = discover_site_links(browser, company)
         except Exception as e:
-            logger.warning(f"LinkedIn search contact discovery failed for {company.name}: {e}")
+            logger.debug(f"Homepage link discovery failed for {company.name}: {e}")
 
-    if guard("team_page"):
+    if "team_page" in sources:
         try:
-            team, text, emails = from_team_pages(browser, llm, company)
-            raw.extend(team)
+            team, text, emails = from_team_pages(browser, llm, company, team_links)
+            add("team_page", team)
             context_parts.append(text)
             result.observed_emails.extend(e for e in emails if e not in result.observed_emails)
         except Exception as e:
             logger.warning(f"Team page discovery failed for {company.name}: {e}")
 
-    if guard("press") or guard("web_search"):
+    if "blog" in sources:
         try:
-            press, text = from_press_and_web(browser, llm, company)
-            raw.extend(press)
+            add("blog", from_blogs(browser, llm, company, blog_links))
+        except Exception as e:
+            logger.warning(f"Blog discovery failed for {company.name}: {e}")
+
+    web_sources = [s for s in ("press", "theorg", "crunchbase", "wellfound") if s in sources]
+    if web_sources:
+        try:
+            found, text = from_web_sources(browser, llm, company, web_sources)
+            add("press+web", found)
             context_parts.append(text)
         except Exception as e:
             logger.warning(f"Press/web contact discovery failed for {company.name}: {e}")
 
-    if guard("github"):
+    if "github" in sources:
         try:
             gh = GitHubClient(browser, config.api_keys.get("github"))
             org = company.github_org or gh.find_org(company.name, company.domain)
             if org:
                 company.github_org = org
-                raw.extend(_person_to_candidate(p) for p in gh.org_people(org))
+                add("github", [_person_to_candidate(p) for p in gh.org_people(org)])
                 if company.domain:
                     result.email_samples.extend(gh.commit_email_samples(org, company.domain))
         except Exception as e:
             logger.info(f"GitHub contact discovery skipped for {company.name}: {e}")
+
+    if "linkedin_search" in sources and config.discovery.allow_linkedin:
+        try:
+            add("linkedin_search", from_linkedin_search(browser, company, personas))
+        except Exception as e:
+            logger.warning(f"LinkedIn search contact discovery failed for {company.name}: {e}")
 
     for _name, email in result.email_samples:
         if email not in result.observed_emails:
@@ -365,4 +642,5 @@ def discover_contacts(
                 break
     result.candidates = merged
     result.context_text = "\n".join(p for p in context_parts if p)[:8000]
+    logger.info(f"Contact sources for {company.name}: {result.sources_tried}")
     return result

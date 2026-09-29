@@ -119,14 +119,16 @@ class MockLLMProvider:
             return EmailGenResponse(
                 subject="Internship interest at MockTech",
                 body_html=(
-                    "<p>Hi Alice,</p><p>I read about MockTech's recent Series A and the new workflow automation "
-                    "product your team shipped for mid-sized finance teams this quarter.</p><p>I am a third-year "
-                    "computer science student and interned at Jio Platforms, where I worked on systems that collect "
-                    "and analyse large volumes of telemetry data.</p><p>That experience with dependable data "
-                    "pipelines seems close to the reliability problems your platform solves for customers every "
-                    "day.</p><p>I would love to be considered for relevant software engineering internship "
-                    "opportunities on your team.</p><p>If there is a suitable opening, I would be grateful for a "
-                    "referral or any guidance on who to contact.</p><p>Best,<br>Jane Doe</p>"
+                    "<p>Hi Alice,</p><p>I was reading about MockTech's Series A and the B2B SaaS product you "
+                    "sell to finance teams, especially how much of their month-end work it takes off their plate."
+                    "</p><p>I'm a computer science student looking for a software engineering internship. Over the "
+                    "last year I have built backend services in Python and FastAPI that collect operational data "
+                    "from several internal tools, clean it up and make it available to the people who need to act "
+                    "on it every morning.</p><p>Most of that work was about keeping the pipeline dependable when "
+                    "inputs were messy, which is why a product that finance teams rely on every day interests me "
+                    "more than a demo project would.</p><p>If your team is taking interns this year, I'd be glad to "
+                    "hear where I should apply, or who on the team I could talk to about it.</p>"
+                    "<p>Best,<br>Jane Doe</p>"
                 ),
             )
         elif "ValidationResponse" in str(schema):
@@ -149,7 +151,7 @@ class MockBrowserProvider:
         return "<html><body>Mock Careers text</body></html>"
 
     def extract_text(self, html):
-        return "Mock Careers text"
+        return "Mock Careers text. Alice Developer, Engineering Manager at MockTech, leads the payments team."
 
 
 class MockGmailProvider:
@@ -280,7 +282,7 @@ def test_targeted_outreach_speculative(tmp_path):
     # 2. Setup mock runner config
     config_data = load_config("config.example.yaml")
     config_data.pipeline.db_path = ":memory:"
-    # Enable speculative outreach
+    # Legacy flag: must no longer produce a "<role> (Speculative Application)" job
     config_data.job_preferences.allow_speculative_outreach = True
 
     temp_resume = tmp_path / "resume.typ"
@@ -307,10 +309,13 @@ def test_targeted_outreach_speculative(tmp_path):
     assert app.state == "Completed"
     assert app.current_stage == 12
     assert app.job.company.name == "NoJobsCorp"
-    # Verify speculative job details
-    assert "Speculative Application" in app.job.title
-    assert app.job.url.startswith("speculative://")
-    
+    # No opening exists, so the targeted company gets a company-level inquiry instead of an invented job title
+    assert app.outreach_type == "company_speculative" and app.is_company_level
+    assert app.job.source == "company_outreach" and app.job.url.startswith("company-outreach://")
+    assert app.job.title == "Company-level internship inquiry"
+    assert "Speculative Application" not in app.job.title
+    assert not any(role.lower() in app.job.title.lower() for role in config_data.job_preferences.roles)
+
     session.close()
 
 

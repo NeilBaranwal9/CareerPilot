@@ -1,5 +1,4 @@
 import contextlib
-import html
 import json
 import logging
 import os
@@ -8,11 +7,14 @@ import subprocess
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from src.config import AppConfig
 from src.db.models import (
+    COMPANY_OUTREACH_SOURCE,
+    COMPANY_OUTREACH_TITLE,
+    NON_OPENING_SOURCES,
     Application,
     Company,
     Contact,
@@ -20,10 +22,20 @@ from src.db.models import (
     History,
     Job,
     ResumeVersion,
+    outreach_type_for,
 )
-from src.intel.classify import classify_role, classify_sector, normalize_funding_stage, normalize_sector
-from src.intel.learning import compute_outcome_stats, estimate_response_probability
+from src.intel.classify import (
+    classify_role,
+    classify_sector,
+    describe_role_families,
+    normalize_funding_stage,
+    normalize_sector,
+    role_families,
+    role_search_terms,
+)
+from src.intel.learning import compute_outcome_stats, estimate_response_probability, explain_reply_probability
 from src.intel.scoring import FitResult, compute_company_fit, rule_based_opportunity, title_relevance, weighted_total
+from src.outreach.dedupe import find_duplicate, record_outreach
 from src.outreach.engine import get_initial_email, log_event, recipient_already_contacted
 from src.outreach.personas import (
     DEFAULT_FOLLOWUP_PROMPT,
@@ -33,12 +45,29 @@ from src.outreach.personas import (
     fallback_followups,
     find_placeholders,
     first_name,
-    guideline_for,
     html_to_plain,
     safe_format,
     tone_for,
 )
 from src.outreach.scheduling import next_send_slot, utc_now_naive
+from src.outreach.voice import (
+    COMPANY_OUTREACH_WORDS,
+    OPENING_STYLES,
+    check_company_inquiry,
+    check_grounding,
+    check_subject,
+    check_voice,
+    choose_opening,
+    company_outreach_ask,
+    jargon_sentences,
+    overused_recent_phrases,
+    persona_ask,
+    persona_focus,
+    recent_patterns_summary,
+    recent_sentence_starts,
+    research_signals,
+    word_target,
+)
 from src.pipeline.schemas import (  # noqa: F401  (re-exported for backwards compatibility)
     CompanyListResponse,
     CompanyResearchResponse,
@@ -51,6 +80,7 @@ from src.pipeline.schemas import (  # noqa: F401  (re-exported for backwards com
     FollowUpSequenceSchema,
     JobListResponse,
     OpportunityScoreResponse,
+    PlainSummarySchema,
     ResumeTailorResponse,
     StructuredResumeSchema,
     ValidationResponse,
@@ -58,9 +88,11 @@ from src.pipeline.schemas import (  # noqa: F401  (re-exported for backwards com
 from src.providers.browser import BrowserProvider
 from src.providers.gmail import GmailProvider
 from src.providers.llm import BaseLLMProvider
+from src.providers.llm.ollama import OllamaUnavailableError
+from src.providers.llm.router import BudgetExceededError
 from src.sources.ats import ats_job_to_dict, detect_ats_from_html, filter_relevant_jobs, probe_ats
 from src.sources.companies import CompanyCandidate, DiscoverySpec, normalize_company_name, run_discovery
-from src.sources.contacts import ContactCandidate, discover_contacts, rank_contacts
+from src.sources.contacts import ContactCandidate, discover_contacts, personas_for_families, rank_contacts
 from src.sources.emails import find_contact_email, verification_timestamp
 from src.sources.enrichment import ApolloClient
 from src.sources.job_boards import (
@@ -71,6 +103,7 @@ from src.sources.job_boards import (
     search_wellfound_jobs,
 )
 from src.utils.caching import DBCache
+from src.utils.claims import find_unsupported_claims
 from src.utils.logging import PipelineLogger
 from src.utils.resume import format_highlights, rank_highlights, read_resume_text, select_resume_variant
 from src.utils.resume_pdf import (
@@ -210,6 +243,7 @@ def run_stage_0_company_discovery(
                 all_exclusions,
                 config.job_preferences.roles,
                 config.discovery.ats_boards,
+                config.discovery.allow_linkedin,
             )
         except Exception as e:
             p_log.error(f"Company discovery failed: {e}")
@@ -265,9 +299,10 @@ def _llm_jobs_from_text(llm: BaseLLMProvider, config: AppConfig, company: Compan
     prompt = (
         f"Analyze this scraped text from {company.name}'s search results and career sites:\n\n"
         f"{text}\n\n"
-        f"Extract any open software engineering jobs that match these preferred roles: "
+        f"Extract the open jobs or internships listed above that match these preferred roles: "
         f"{config.job_preferences.roles}. Look for experience requirements close to: "
-        f"up to {config.job_preferences.experience_years_max} years (SDE-1, Entry Level, Graduate)."
+        f"up to {config.job_preferences.experience_years_max} years (intern, entry level, graduate). "
+        f"Only list roles that are actually posted in the text; never make up a title."
     )
     response = llm.generate_json(prompt, JobListResponse)
     assert isinstance(response, JobListResponse)
@@ -275,10 +310,17 @@ def _llm_jobs_from_text(llm: BaseLLMProvider, config: AppConfig, company: Compan
 
 
 def _discover_jobs_for_company(
-    config: AppConfig, llm: BaseLLMProvider, browser: BrowserProvider, company: Company, p_log: PipelineLogger
+    config: AppConfig,
+    llm: BaseLLMProvider,
+    browser: BrowserProvider,
+    company: Company,
+    p_log: PipelineLogger,
+    sources: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    sources = config.discovery.job_sources
+    sources = config.discovery.job_sources if sources is None else sources
     prefs = config.job_preferences
+    # Search terms come from your configured roles (e.g. "product analyst data analyst"), never a default "engineer".
+    role_terms = role_search_terms(prefs.roles)
     jobs: list[dict[str, Any]] = []
     extra = _extra(company)
 
@@ -322,10 +364,10 @@ def _discover_jobs_for_company(
         except Exception as e:
             p_log.warning(f"ATS lookup failed for {company.name}: {e}")
 
-    if "linkedin" in sources:
+    if "linkedin" in sources and config.discovery.allow_linkedin:
         try:
             location = next((g for g in prefs.geographies if g.lower() != "remote"), "India")
-            role = prefs.roles[0] if prefs.roles else "Software Engineer"
+            role = prefs.roles[0] if prefs.roles else "internship"
             for posting in search_linkedin_jobs(browser, f"{company.name} {role}", location, max_results=25):
                 if company_name_matches(posting["company"], company.name):
                     posting = {**posting, "salary": None, "experience_years": None, "description": None}
@@ -341,18 +383,19 @@ def _discover_jobs_for_company(
 
     if "wellfound" in sources:
         try:
-            jobs.extend(search_wellfound_jobs(browser, company.name))
+            jobs.extend(search_wellfound_jobs(browser, company.name, role_terms=role_terms))
         except Exception as e:
             p_log.info(f"Wellfound job search skipped for {company.name}: {e}")
 
     if "indeed" in sources:
         try:
-            jobs.extend(search_indeed_jobs(browser, company.name, prefs.roles[0] if prefs.roles else "software engineer"))
+            jobs.extend(search_indeed_jobs(browser, company.name, " ".join(role_terms)))
         except Exception as e:
             p_log.info(f"Indeed job search skipped for {company.name}: {e}")
 
     if "web_search" in sources and not any(j.get("source") not in ("wellfound", "indeed") for j in jobs):
-        search_results = browser.search_google(f"'{company.name}' software engineer careers jobs", num_results=3)
+        query = " ".join([f"'{company.name}'", *role_terms, "careers jobs"])
+        search_results = browser.search_google(query, num_results=3)
         scraped_text = ""
         for result in search_results:
             try:
@@ -383,7 +426,7 @@ def _discover_jobs_for_company(
         unique.append(job)
     unique = [j for j in unique if not GENERIC_JOB_TITLE.match(str(j.get("title")).strip())]
     if unique:
-        # The company is hiring even if none of its postings fit you (speculative outreach can still apply).
+        # The company is hiring even if none of its postings fit you (a company-level inquiry can still apply).
         company.hiring_status = "hiring"
         company.open_roles_count = max(company.open_roles_count or 0, len(unique))
     unique.sort(key=lambda j: title_relevance(str(j.get("title")), prefs.roles, prefs.experience_years_max), reverse=True)
@@ -408,17 +451,31 @@ GENERIC_JOB_TITLE = re.compile(
 )
 
 
-def _speculative_job(config: AppConfig, company: Company) -> dict[str, Any]:
-    preferred_role = config.job_preferences.roles[0] if config.job_preferences.roles else "Software Engineer"
+def company_outreach_target(config: AppConfig, company: Company) -> dict[str, Any]:
+    """
+    The record behind a company-level (speculative) inquiry. Its title is a label, not a role name, and its
+    description says plainly that no matching public opening was found.
+    """
+    areas = describe_role_families(role_families(config.job_preferences.roles), limit=6)
+    slug = re.sub(r"[^a-z0-9]+", "_", (company.domain or company.name).lower()).strip("_")
     return {
-        "title": f"{preferred_role} (Speculative Application)",
-        "url": f"speculative://{company.name.lower().replace(' ', '_')}",
-        "location": config.job_preferences.geographies[0] if config.job_preferences.geographies else "Remote",
+        "title": COMPANY_OUTREACH_TITLE,
+        "url": f"company-outreach://{slug}",
+        "location": None,
         "salary": None,
-        "experience_years": config.job_preferences.experience_years_max,
-        "description": f"Speculative outreach for a {preferred_role} position matching the company's tech stack and domain.",
-        "source": "speculative",
+        "experience_years": None,
+        "description": "No matching public opening was found. Company-level inquiry about current or upcoming "
+        f"internship opportunities{f' in {areas}' if areas else ''}.",
+        "source": COMPANY_OUTREACH_SOURCE,
     }
+
+
+def outreach_role_label(config: AppConfig, app: Application) -> str:
+    """What the outreach is about: the real job title, or your target role families for a company-level inquiry."""
+    if not app.is_company_level:
+        return app.job.title
+    areas = describe_role_families(role_families(config.job_preferences.roles))
+    return f"internship opportunities in {areas}" if areas else "internship opportunities"
 
 
 def run_stage_1_job_discovery(
@@ -428,14 +485,38 @@ def run_stage_1_job_discovery(
     browser: BrowserProvider,
     companies: list[Company],
     run_id: str,
+    mode: str | None = None,
 ) -> list[Job]:
     """
     Stage 1: Job Discovery
     Finds open roles at each company from ATS boards (Greenhouse/Lever/Ashby/Workable/SmartRecruiters), LinkedIn,
-    the careers page, Wellfound, Indeed and web search. Companies without postings get a speculative job
-    (when allow_speculative_outreach is on) so they can still be contacted.
+    the careers page, Wellfound, Indeed and web search, depending on `mode` (default `discovery.mode`):
+    - job_search: only real openings that match your roles; companies without one are skipped.
+    - company_outreach: checks the company's own careers page/ATS board; without a matching opening the company
+      gets a company-level inquiry (no public opening required).
+    - hybrid: full job search; companies without a matching opening fall back to a company-level inquiry.
+    A job title is never invented: a company-level inquiry is labelled as such and never names a role.
     """
     p_log = PipelineLogger(logger, run_id, "Stage 1: Job Discovery")
+    mode = mode or config.discovery.mode
+    p_log.info(f"[DISCOVERY] Mode: {mode}")
+    sources = list(config.discovery.job_sources)
+    if mode == "company_outreach":
+        p_log.info("[DISCOVERY] Company-level outreach enabled; public job opening not required.")
+        sources = [s for s in sources if s in ("ats", "career_page")]
+        p_log.info("[DISCOVERY] Checking each company's careers page / ATS board for a matching opening...")
+    else:
+        p_log.info("[DISCOVERY] Searching for actual openings...")
+        if mode == "hybrid":
+            p_log.info("[DISCOVERY] Hybrid: companies without a matching opening get a company-level inquiry.")
+    if any(s in sources for s in ("wellfound", "indeed", "web_search", "linkedin")):
+        terms = role_search_terms(config.job_preferences.roles)
+        p_log.info(f"[DISCOVERY] Job-search terms from your target roles: {', '.join(terms) or '(none: generic search)'}")
+    if mode == "job_search" and config.job_preferences.allow_speculative_outreach:
+        p_log.warning(
+            "[DISCOVERY] job_preferences.allow_speculative_outreach is deprecated and no longer creates speculative "
+            "jobs. Set discovery.mode: hybrid (or company_outreach) to contact companies without a matching opening."
+        )
     p_log.info(f"Searching jobs for {len(companies)} companies...")
 
     all_jobs = []
@@ -444,7 +525,9 @@ def run_stage_1_job_discovery(
         p_log.company = company.name
 
         cache = DBCache(session)
-        cache_key = f"job_discovery_v2_{company.name.lower()}"
+        # v3: role-aware queries/matching (v2 results were searched with a hard-coded "engineer" query)
+        scope = "careers_" if mode == "company_outreach" else ""
+        cache_key = f"job_discovery_v3_{scope}{company.name.lower()}"
         cached_jobs = cache.get(cache_key)
 
         jobs_data: list[dict[str, Any]] = []
@@ -452,20 +535,26 @@ def run_stage_1_job_discovery(
             p_log.info(f"Found cached job listings for {company.name}")
             jobs_data = list(cached_jobs)
         else:
-            jobs_data = _discover_jobs_for_company(config, llm, browser, company, p_log)
-            cache.set(cache_key, jobs_data, config.pipeline.cache_lifetime_seconds)
+            jobs_data = _discover_jobs_for_company(config, llm, browser, company, p_log, sources=sources)
+            cache.set(cache_key, jobs_data, config.pipeline.research_cache_days * 86400)
 
-        real_jobs = [j for j in jobs_data if j.get("source") != "speculative"]
+        real_jobs = [j for j in jobs_data if j.get("source") not in NON_OPENING_SOURCES]
+        jobs_data = real_jobs
         if real_jobs:
             company.hiring_status = "hiring"
             company.open_roles_count = max(company.open_roles_count or 0, len(real_jobs))
-        elif company.hiring_status != "hiring":
-            company.hiring_status = "no_public_openings"
-
-        if not jobs_data and config.job_preferences.allow_speculative_outreach:
-            speculative = _speculative_job(config, company)
-            p_log.info(f"No active job listings found. Creating speculative job: '{speculative['title']}' for {company.name}")
-            jobs_data = [speculative]
+            p_log.info(f"[OUTREACH] Matching opening found -> job-specific outreach ({real_jobs[0].get('title')})")
+        else:
+            if company.hiring_status != "hiring":
+                company.hiring_status = "no_public_openings"
+            p_log.info(f"[OUTREACH] No matching public opening found for {company.name}")
+            if mode == "job_search":
+                p_log.info("[OUTREACH] job_search mode -> skipping company (no speculative job is created)")
+            else:
+                if mode == "hybrid":
+                    p_log.info("[OUTREACH] Hybrid mode -> falling back to company-level outreach")
+                p_log.info("[OUTREACH] Creating company-level speculative outreach")
+                jobs_data = [company_outreach_target(config, company)]
 
         for j_data in jobs_data:
             # Normalize URL: empty/whitespace-only becomes None
@@ -524,7 +613,14 @@ def run_stage_2_filtering(
                 active_applications.append(existing_app)
             continue
 
-        app = Application(run_id=run_id, job_id=job.id, current_stage=2, state="Filtering", campaign_id=campaign_id)
+        app = Application(
+            run_id=run_id,
+            job_id=job.id,
+            current_stage=2,
+            state="Filtering",
+            campaign_id=campaign_id,
+            outreach_type=outreach_type_for(job.source),
+        )
         session.add(app)
         session.flush()  # Populate app.id
 
@@ -550,8 +646,10 @@ def run_stage_2_filtering(
             history.notes = f"Filtered out: company rejected by fit scoring ({company.fit_reasoning})."
             continue
 
-        # 2. Keyword Exclusions in title
-        is_keyword_excluded = any(ex_k.lower() in job.title.lower() for ex_k in config.exclusions.keywords)
+        # 2. Keyword Exclusions in title (a company-level inquiry has no posting title to screen)
+        is_keyword_excluded = not app.is_company_level and any(
+            ex_k.lower() in job.title.lower() for ex_k in config.exclusions.keywords
+        )
         if is_keyword_excluded:
             app.state = "Ghost Job"
             history.notes = f"Filtered out: job title '{job.title}' contains excluded keywords."
@@ -605,7 +703,7 @@ def run_stage_2_filtering(
             )
         )
         active_applications.append(app)
-        p_log.info(f"Passed filtering: {job.title} at {company.name}")
+        p_log.info(f"Passed filtering: {job.title} at {company.name}" + (" (no public opening)" if app.is_company_level else ""))
 
     session.commit()
     p_log.company = None
@@ -748,7 +846,7 @@ def research_company(
         )
         response = llm.generate_json(prompt, CompanyResearchResponse)
         research = response.model_dump()
-        cache.set(cache_key, research, config.pipeline.cache_lifetime_seconds)
+        cache.set(cache_key, research, config.pipeline.research_cache_days * 86400)
 
     _apply_research(company, research, news_results, apollo)
 
@@ -935,7 +1033,7 @@ def run_stage_4_contact_research(
             cache.set(
                 cache_key,
                 {"candidates": [c.__dict__ for c in candidates], "intel": intel},
-                config.pipeline.cache_lifetime_seconds,
+                config.pipeline.research_cache_days * 86400,
             )
 
     # Never re-target people who asked not to be contacted or were already emailed.
@@ -947,7 +1045,11 @@ def run_stage_4_contact_research(
     candidates = [c for c in candidates if c.name not in blocked]
 
     stats = compute_outcome_stats(session, config)
-    ranked = rank_contacts(candidates, company, config, stats)
+    preferred: list[str] | None = None
+    if app.is_company_level:
+        preferred = personas_for_families(role_families(config.job_preferences.roles), company)
+        p_log.info(f"[OUTREACH] Company-level inquiry: preferring {', '.join(preferred[:5])} (from your target roles)")
+    ranked = rank_contacts(candidates, company, config, stats, preferred_personas=preferred)
 
     if not ranked and config.contacts.allow_generic_inbox:
         p_log.warning("No named contacts discovered. Falling back to the company's hiring inbox.")
@@ -1121,6 +1223,8 @@ def run_stage_5_email_discovery(
     target.email_status = result.status
     target.email_confidence = result.confidence
     target.email_source = result.source
+    target.email_confidence_level = result.level
+    target.email_evidence = result.evidence
     target.email_verified_at = verification_timestamp()
     if result.pattern and not company.email_pattern:
         company.email_pattern = result.pattern
@@ -1133,7 +1237,7 @@ def run_stage_5_email_discovery(
             stage=6,
             state="Opportunity Scoring",
             run_id=run_id,
-            notes=f"Discovered email: {clean_email} [{result.status}, confidence {result.confidence:.2f}, via {result.source}]. Moving to Scoring.",
+            notes=f"Discovered email: {clean_email} [{result.level}] evidence: {result.evidence[:300]}. Moving to Scoring.",
         )
     )
     session.commit()
@@ -1180,7 +1284,7 @@ def run_stage_6_opportunity_scoring(
             f"4. company_quality: Reputation, engineering culture, stability.\n"
             f"5. growth: Industry sector potential, career acceleration.\n"
             f"6. confidence: Reliability of the job and company data found.\n\n"
-            f"Note: If this is a 'Speculative Application' (indicated in the title/description with no active public job listing), "
+            f"Note: If this is a company-level internship inquiry (no active public job listing; see the title/description), "
             f"evaluate and score 'role_match' and 'confidence' based on the company's tech stack suitability, engineering team size/growth, "
             f"and the relevance of their business domain to the candidate's preferred roles, rather than requiring an active public job listing. "
             f"Set the confidence score based on the completeness and quality of the company's research data."
@@ -1218,9 +1322,16 @@ def run_stage_6_opportunity_scoring(
 
     stats = compute_outcome_stats(session, config)
     contact = app.contact
-    app.response_probability = estimate_response_probability(
-        company, stats, persona=app.persona, email_status=contact.email_status if contact else None
+    email_level = (contact.email_confidence_level or contact.email_status) if contact else None
+    reply = explain_reply_probability(
+        company,
+        stats,
+        persona=app.persona,
+        email_level=email_level,
+        resume_match=(float(final["role_match"]) + float(final["tech_stack"])) / 2,
+        relevant_job=(job.source not in (*NON_OPENING_SOURCES, "pasted")) or None,
     )
+    app.response_probability = float(reply["final"])
     app.score = weighted_total(final, config)
     app.score_breakdown = {
         **final,
@@ -1230,12 +1341,12 @@ def run_stage_6_opportunity_scoring(
         "rules": rules,
         "company_fit": company.fit_score,
         "response_probability": app.response_probability,
+        "reply_probability": reply,
     }
     session.commit()
 
     p_log.info(
-        f"Weighted Score: {app.score:.2f} (Threshold: {config.scoring.thresholds.minimum_score}); "
-        f"reply probability {app.response_probability:.1%}"
+        f"Weighted Score: {app.score:.2f} (Threshold: {config.scoring.thresholds.minimum_score})\n{reply['explanation']}"
     )
 
     if app.score < config.scoring.thresholds.minimum_score:
@@ -1405,33 +1516,45 @@ def _resume_from_document(
     template = config.prompts.resume_tailoring_structured or STRUCTURED_TAILOR_PROMPT
     prompt = safe_format(
         template,
-        role_name=job.title,
+        role_name=outreach_role_label(config, app),
         company_name=company.name,
         variant_name=choice.name,
         variant_focus=choice.focus or "general software engineering",
         base_resume_text=original_text[:12000],
-        job_description=(job.description or "Not available (speculative outreach)")[:3000],
+        job_description=(job.description or "Not available")[:3000],
         company_description=company.description or "",
         company_sector=company.sector or "unknown",
         tech_stack=", ".join(str(t) for t in stack or []),
         highlights=format_highlights(highlights),
     )
-    try:
-        tailored = llm.generate_json(prompt, StructuredResumeSchema)
-        assert isinstance(tailored, StructuredResumeSchema)
-    except Exception as e:
-        p_log.warning(f"Structured resume tailoring failed ({e}); attaching the original resume.")
-        return _record_resume(
-            session, app, run_id, p_log, source_path, source_path, choice.name, [],
-            f"Tailoring failed ({e}); attached original {choice.name} resume.", highlight_names,
-        )
+    tailored: StructuredResumeSchema | None = None
+    violations: list[str] = []
+    for attempt in range(2):  # generate, then regenerate once with the guard's findings
+        attempt_prompt = prompt
+        if violations:
+            attempt_prompt += (
+                "\n\nYour previous version was rejected because it introduced facts that are not in the original "
+                "resume:\n- " + "\n- ".join(violations[:10]) + "\nRemove every one of them and keep only original facts."
+            )
+        try:
+            candidate = llm.generate_json(attempt_prompt, StructuredResumeSchema)
+            assert isinstance(candidate, StructuredResumeSchema)
+        except Exception as e:
+            p_log.warning(f"Structured resume tailoring failed ({e}); attaching the original resume.")
+            return _record_resume(
+                session, app, run_id, p_log, source_path, source_path, choice.name, [],
+                f"Tailoring failed ({e}); attached original {choice.name} resume.", highlight_names,
+            )
+        violations = check_tailored_resume(original_text, candidate)
+        if not violations:
+            tailored = candidate
+            break
+        p_log.warning(f"Tailored resume attempt {attempt + 1} rejected by fabrication guard: {violations[:3]}")
 
-    violations = check_tailored_resume(original_text, tailored)
-    if violations:
-        p_log.warning(f"Tailored resume rejected by fabrication guard: {violations[:3]}")
+    if tailored is None:
         return _record_resume(
             session, app, run_id, p_log, source_path, source_path, choice.name, [],
-            f"Tailored version rejected ({'; '.join(violations[:3])}); attached original {choice.name} resume.",
+            f"Tailored version rejected twice ({'; '.join(violations[:3])}); attached original {choice.name} resume.",
             highlight_names,
         )
 
@@ -1568,7 +1691,7 @@ def run_stage_7_resume_tailoring(
         stack = company.tech_stack if isinstance(company.tech_stack, list) else (company.research_data or {}).get("tech_stack", [])
         tech_stack = ", ".join(str(t) for t in stack or [])
         values = {
-            "role_name": job.title,
+            "role_name": outreach_role_label(config, app),
             "company_name": company.name,
             "tech_stack": tech_stack,
             "base_resume_text": base_resume_text,
@@ -1702,15 +1825,130 @@ def _signature(config: AppConfig, body_html: str) -> str:
         link_parts.append(f'<a href="{linkedin}">{linkedin.replace("https://", "").replace("http://", "")}</a>')
     if github:
         link_parts.append(f'<a href="{github}">{github.replace("https://", "").replace("http://", "")}</a>')
+    if user_name and user_name not in body_html:
+        body_html += f"<p>Best,<br>{user_name}</p>"
     if link_parts:
         signature_links = "<br>" + " | ".join(link_parts)
         already_has_links = any(url in body_html for url in [linkedin, github] if url)
         if not already_has_links:
             if user_name and user_name in body_html:
-                body_html = body_html.replace(user_name, f"{user_name}{signature_links}", 1)
+                idx = body_html.rfind(user_name)
+                body_html = body_html[: idx + len(user_name)] + signature_links + body_html[idx + len(user_name) :]
             else:
                 body_html += f"<p>{signature_links}</p>"
     return body_html
+
+
+MAX_EMAIL_DEFERRALS = 3
+
+PLAIN_SUMMARY_PROMPT = """Rewrite this resume item as ONE plain sentence (max 28 words) that a non-engineer would
+understand: what the person did and what the system was for. Mention at most one technology name. Keep every fact
+exactly as given; do not add results, numbers or claims. Start with the organisation or project name.
+
+Item: {item}
+"""
+
+
+def plain_highlights(
+    session: Session, helper_llm: BaseLLMProvider | None, highlights: list[Any], resume_text: str, limit: int = 2
+) -> list[str]:
+    """
+    Plain-language one-liners for the most relevant highlights, written once by the (local) helper model and cached
+    for 30 days. Falls back to nothing if the helper is unavailable or the rewrite adds facts or jargon.
+    """
+    if helper_llm is None or not highlights:
+        return []
+    cache = DBCache(session)
+    out: list[str] = []
+    for h in highlights[:limit]:
+        item = f"{h.name}: {h.summary}" if h.summary else h.name
+        key = "plain_highlight_" + re.sub(r"[^a-z0-9]+", "_", item.lower())[:150]
+        cached = cache.get(key)
+        if isinstance(cached, str) and cached:
+            out.append(cached)
+            continue
+        try:
+            result = helper_llm.generate_json(safe_format(PLAIN_SUMMARY_PROMPT, item=item), PlainSummarySchema)
+            assert isinstance(result, PlainSummarySchema)
+            sentence = result.summary.strip()
+        except Exception as e:
+            logger.info(f"Plain summary for '{h.name}' unavailable: {e}")
+            continue
+        if not sentence or find_unsupported_claims(sentence, item + " " + resume_text) or jargon_sentences(sentence):
+            continue
+        cache.set(key, sentence, 30 * 86400)
+        out.append(sentence)
+    return out
+
+
+COMPANY_OUTREACH_RULES = """
+This is a company-level inquiry, not an application to a posted job:
+- No matching public opening was found at {company_name}. Do not say or imply that a specific role, opening, posting
+  or vacancy exists: never write "I saw your opening/posting for ...", "applying for the ... role", "your open
+  positions", and never state or guess hiring plans ("you're growing the team", "you're hiring").
+- The areas I'm interested in: {role_families}. Mention the one or two that suit this recipient best, naturally, once.
+- Use only ONE experience or project: the one most relevant to those areas.
+"""
+
+
+def _word_range(config: AppConfig, app: Application) -> tuple[int, int]:
+    """Company-level inquiries are shorter (about 100-150 words) than job-specific emails."""
+    if app.is_company_level:
+        return COMPANY_OUTREACH_WORDS
+    return config.outreach.min_words, config.outreach.max_words
+
+
+def clean_role_name(title: str | None) -> str:
+    """'Product Analyst Intern (Speculative Application)' -> 'Product Analyst'."""
+    cleaned = re.sub(r"\((?:speculative application|targeted outreach)\)", "", title or "", flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b(intern(ship)?|trainee)\b", "", cleaned, flags=re.IGNORECASE)
+    return re.sub(r"\s{2,}", " ", cleaned).strip(" -,") or "software engineering"
+
+
+def _recent_initial_emails(session: Session, exclude_app_id: int, limit: int = 5) -> list[Email]:
+    """The most recent first emails written for OTHER applications (used to avoid repeating ourselves)."""
+    return (
+        session.query(Email)
+        .filter(
+            Email.application_id != exclude_app_id,
+            or_(Email.sequence_step == 0, Email.sequence_step.is_(None)),
+            Email.status != "cancelled",
+        )
+        .order_by(Email.id.desc())
+        .limit(limit)
+        .all()
+    )
+
+
+def _defer_email_generation(
+    session: Session, app: Application, run_id: str, p_log: PipelineLogger, err: Exception
+) -> bool:
+    """
+    Keeps the application in Email Generation so a later run retries it. Budget/rate-limit/outage deferrals are
+    unlimited (they resolve themselves); other errors fail the application after MAX_EMAIL_DEFERRALS attempts.
+    """
+    transient = isinstance(err, BudgetExceededError | OllamaUnavailableError) or any(
+        marker in str(err).lower() for marker in ("rate limit", "429", "all groq models failed", "timeout", "unavailable")
+    )
+    previous = (
+        session.query(History)
+        .filter(History.application_id == app.id, History.state == "Email Deferred")
+        .count()
+    )
+    if not transient and previous + 1 >= MAX_EMAIL_DEFERRALS:
+        app.state = "Failed"
+        session.add(History(application_id=app.id, stage=8, state="Failed", run_id=run_id,
+                            notes=f"Email generation failed {previous + 1} times: {str(err)[:300]}"))
+        session.commit()
+        p_log.error(f"Email generation failed permanently: {err}")
+        return False
+    app.current_stage = 8
+    app.state = "Email Generation"
+    session.add(History(application_id=app.id, stage=8, state="Email Deferred", run_id=run_id,
+                        notes=f"Deferred ({'transient' if transient else f'attempt {previous + 1}'}): {str(err)[:300]}"))
+    session.commit()
+    p_log.warning(f"Email generation deferred to a later run: {err}", status="DEFERRED")
+    return False
 
 
 def run_stage_8_email_generation(
@@ -1719,6 +1957,8 @@ def run_stage_8_email_generation(
     llm: BaseLLMProvider,
     app: Application,
     run_id: str,
+    followup_llm: BaseLLMProvider | None = None,
+    helper_llm: BaseLLMProvider | None = None,
 ) -> bool:
     """
     Stage 8: Email Generation
@@ -1737,6 +1977,10 @@ def run_stage_8_email_generation(
     persona = app.persona or contact.role_category or classify_role(contact.role)[0]
     app.persona = persona
     tone = tone_for(persona, config.outreach.tone, config.outreach.persona_tones)
+    company_level = app.is_company_level
+    families = role_families(config.job_preferences.roles)
+    if company_level:
+        p_log.info("[OUTREACH] Writing a company-level inquiry (no public opening is claimed)")
 
     rv = (
         session.query(ResumeVersion)
@@ -1756,25 +2000,78 @@ def run_stage_8_email_generation(
         "contact_name": contact.name,
         "contact_role": contact.role,
         "company_name": company.name,
-        "role_name": job.title,
+        "role_name": outreach_role_label(config, app),
         "product_description": research.get("business_model", "their innovative platform"),
         "tech_stack": ", ".join(stack or research.get("tech_stack", ["modern tools"])),
         "recent_launches": _format_news(company.recent_news) if company.recent_news else research.get("funding", "recent engineering progress"),
         "tailored_skills": tailored_skills,
         "company_description": company.description or research.get("business_model", ""),
         "recent_news": _format_news(company.recent_news),
-        "job_description": (job.description or "Not available (speculative outreach)")[:2000],
+        "company_products": ", ".join(str(p) for p in (research.get("products") or [])[:6]) or "Not available",
+        "job_description": (job.description or "Not available")[:2000],
         "contact_background": contact.background or "Not available",
-        "highlights": format_highlights(highlights[:4]),
+        "highlights": "",  # filled below with plain-language versions when available
         "resume_summary": resume_text[:6000] or "Not available",
-        "persona_guidelines": guideline_for(persona),
+        "persona_guidelines": persona_focus(persona),
         "tone": describe_tone(tone),
         "user_name": config.user_identity.name,
     }
+    plain = plain_highlights(session, helper_llm, highlights, resume_text)
+    raw_lines = format_highlights(highlights[:4]).splitlines()
+    values["highlights"] = "\n".join(
+        f"{i}. {plain[i - 1]}" if i <= len(plain) else line for i, line in enumerate(raw_lines, start=1)
+    ) + ("\n(Use this plain wording level; the resume is only the source of facts.)" if plain else "")
     prompt = safe_format(config.prompts.email_generation, **values)
     if "{job_description}" not in config.prompts.email_generation:
         prompt += safe_format(EMAIL_CONTEXT_BLOCK, **values)
-    prompt += safe_format(EMAIL_STYLE_RULES, first_name=first_name(contact.name))
+    recent = _recent_initial_emails(session, app.id)
+    signals = research_signals(research, company.recent_news, job.source, company.description)
+    opening_style = choose_opening(signals, [e.opening_style or "" for e in recent])
+    min_words, max_words = word_target(persona, *_word_range(config, app))
+    avoid_lines = []
+    overused = overused_recent_phrases([e.body for e in recent])
+    if overused:
+        avoid_lines.append("- Recently overused, so don't use: " + ", ".join(f'"{p}"' for p in overused) + ".\n")
+    starts = recent_sentence_starts([e.body for e in recent], config.user_identity.name)
+    if starts:
+        avoid_lines.append(
+            "- Recent emails already used these sentence openings; start your sentences differently (including the "
+            "one about who I am): " + "; ".join(f'"{s}"' for s in starts) + "\n"
+        )
+    patterns = recent_patterns_summary([e.body for e in recent], config.user_identity.name)
+    if patterns:
+        avoid_lines.append(
+            "- Your last emails opened and asked like this. Use a different opening, sentence structure and ask:\n"
+            + "\n".join(f"  {line}" for line in patterns.splitlines())
+            + "\n"
+        )
+    prompt += safe_format(
+        EMAIL_STYLE_RULES,
+        first_name=first_name(contact.name),
+        min_words=min_words,
+        max_words=max_words,
+        target_role=(describe_role_families(families) or "relevant") if company_level else clean_role_name(job.title),
+        opening_instruction=OPENING_STYLES[opening_style],
+        ask_instruction=(
+            company_outreach_ask(persona, config.company_outreach.ask_about_openings)
+            if company_level
+            else persona_ask(persona)
+        ),
+        persona_focus=persona_focus(persona),
+        avoid_block="".join(avoid_lines),
+        user_name=config.user_identity.name,
+    )
+    if company_level:
+        prompt += safe_format(
+            COMPANY_OUTREACH_RULES,
+            company_name=company.name,
+            role_families=describe_role_families(families, limit=6) or "an internship that fits my background",
+        )
+    recent_subjects = [e.subject for e in recent if e.subject]
+    if recent_subjects:
+        prompt += "Subjects already used recently (don't reuse or imitate): " + "; ".join(recent_subjects[:5]) + "\n"
+    if "{company_products}" not in config.prompts.email_generation and values["company_products"] != "Not available":
+        prompt += f"\nTheir products: {values['company_products']}\n"
     retry = (
         session.query(History)
         .filter(History.application_id == app.id, History.state == "Validation Retry")
@@ -1794,17 +2091,8 @@ def run_stage_8_email_generation(
             subject = response.subject
             body_html = response.body_html
         except Exception as err:
-            p_log.warning(f"LLM email generation failed: {err}. Falling back to standard professional email.")
-            subject = f"Software Engineering Opportunities - {company.name}"
-            user_name = config.user_identity.name
-            body_html = (
-                f"<p>Hi {html.escape(contact.name)},</p>"
-                f"<p>I hope you are doing well.</p>"
-                f"<p>I am reaching out because I am very interested in software engineering roles at {html.escape(company.name)}. "
-                f"My background includes {html.escape(tailored_skills)}.</p>"
-                f"<p>I have attached my resume for your review. I would love to connect and chat about how my background might align with your team's goals.</p>"
-                f"<p>Best regards,<br>{html.escape(user_name)}</p>"
-            )
+            # Never fall back to a generic template: keep the application at this stage and retry on a later run.
+            return _defer_email_generation(session, app, run_id, p_log, err)
 
         body_html = _signature(config, body_html)
 
@@ -1821,6 +2109,7 @@ def run_stage_8_email_generation(
             persona=persona,
             tone=tone,
             to_email=contact.email,
+            opening_style=opening_style,
         )
         session.add(email)
         session.flush()
@@ -1838,7 +2127,7 @@ def run_stage_8_email_generation(
                 followup_2_days=steps[1].after_days if len(steps) > 1 else steps[0].after_days,
             )
             try:
-                fu_response = llm.generate_json(fu_prompt, FollowUpSequenceSchema)
+                fu_response = (followup_llm or llm).generate_json(fu_prompt, FollowUpSequenceSchema)
                 assert isinstance(fu_response, FollowUpSequenceSchema)
                 followup_bodies = [f.body_html for f in fu_response.followups if f.body_html][: len(steps)]
             except Exception as err:
@@ -1846,7 +2135,12 @@ def run_stage_8_email_generation(
             if len(followup_bodies) < len(steps):
                 top_highlight = highlights[0].summary or highlights[0].name if highlights else None
                 templates = fallback_followups(
-                    contact.name, company.name, job.title, config.user_identity.name, top_highlight, len(steps)
+                    contact.name,
+                    company.name,
+                    (describe_role_families(families) or "internship") if company_level else job.title,
+                    config.user_identity.name,
+                    top_highlight,
+                    len(steps),
                 )
                 followup_bodies.extend(templates[len(followup_bodies) :])
             for step, body in enumerate(followup_bodies, start=1):
@@ -1892,6 +2186,62 @@ def run_stage_8_email_generation(
         )
         session.commit()
         return False
+
+
+def _email_fact_base(config: AppConfig, app: Application, rv: ResumeVersion) -> str:
+    """Everything an email may legitimately state: resume, your profile notes, company research, JD, contact."""
+    company = app.job.company
+    contact = app.contact
+    resume_text = read_resume_text(rv.path, limit=20000) or read_resume_text(rv.parent_resume, limit=20000)
+    parts = [
+        resume_text,
+        config.prompts.email_generation,  # your own "About me" notes live in the template
+        " ".join(f"{h.name} {h.summary}" for h in config.highlights),
+        config.user_identity.name,
+        company.name,
+        company.description or "",
+        json.dumps(company.research_data or {}),
+        json.dumps(company.recent_news or []),
+        " ".join(str(t) for t in (company.tech_stack or [])) if isinstance(company.tech_stack, list) else "",
+        company.funding_details or "",
+        app.job.title,
+        app.job.description or "",
+    ]
+    if contact is not None:
+        parts += [contact.name, contact.role or "", contact.background or ""]
+    return "\n".join(parts)
+
+
+def _cached_plain_highlights(session: Session, config: AppConfig, app: Application) -> dict[str, str]:
+    """highlight name -> cached plain summary (only those already generated in stage 8)."""
+    cache = DBCache(session)
+    out: dict[str, str] = {}
+    for h in rank_highlights(config, app.job, app.job.company, app.persona)[:3]:
+        item = f"{h.name}: {h.summary}" if h.summary else h.name
+        cached = cache.get("plain_highlight_" + re.sub(r"[^a-z0-9]+", "_", item.lower())[:150])
+        if isinstance(cached, str) and cached:
+            out[h.name] = cached
+    return out
+
+
+def simplify_jargon(body_html: str, plain_by_name: dict[str, str], user_name: str) -> str:
+    """Replaces each tech-stack-list sentence with the plain summary of the highlight it describes (matched by name)."""
+    if not plain_by_name:
+        return body_html
+    body = body_html
+    for ch in ("\u2010", "\u2011", "\u2012"):
+        body = body.replace(ch, "-")
+    for sentence in jargon_sentences(html_to_plain(body)):
+        target = sentence.strip()
+        if target not in body:
+            continue
+        sentence_words = set(re.findall(r"[a-z0-9]+", target.lower()))
+        for name, plain_text in plain_by_name.items():
+            name_words = {w for w in re.findall(r"[a-z0-9]+", name.lower()) if len(w) > 2 and w not in ("internship", "project", "team")}
+            if name_words & sentence_words and plain_text not in body:
+                body = body.replace(target, plain_text.rstrip(".") + ".")
+                break
+    return body
 
 
 def run_stage_9_validation(
@@ -1972,7 +2322,42 @@ def run_stage_9_validation(
         return fail([f"Template placeholder left in email: {p}" for p in placeholders])
 
     # Reply-rate style rules: one rewrite is requested; after that, style issues are logged but not fatal.
-    style_issues = check_email_style(email.body, config.user_identity.name)
+    # Fabrication guard: achievements, rankings, year of study, CGPA and skills must come from the fact base.
+    fact_base = _email_fact_base(config, app, rv)
+    claim_issues = find_unsupported_claims(
+        html_to_plain("\n".join([email.body, *(f.body for f in followups)])), fact_base, numbers="achievements"
+    )
+    if claim_issues:
+        return fail([f"Unsupported claim: {c}" for c in claim_issues])
+
+    # Company/recipient statements must be grounded in research; no invented openings or relationships.
+    company = app.job.company
+    contact = app.contact
+    company_level = app.is_company_level
+    # A company-level inquiry's placeholder record is not evidence about the company, so it is left out.
+    job_text = [] if company_level else [app.job.title, app.job.description or ""]
+    research_text = "\n".join(
+        [
+            company.name, company.description or "", json.dumps(company.research_data or {}),
+            json.dumps(company.recent_news or []), company.funding_details or "", *job_text,
+            " ".join(str(t) for t in company.tech_stack) if isinstance(company.tech_stack, list) else "",
+        ]
+    )
+    recipient_text = " ".join(x for x in [contact.name, contact.role, contact.background] if x) if contact else ""
+    has_real_job = app.job.source not in (*NON_OPENING_SOURCES, "pasted")
+    grounding = check_grounding(
+        email.body, research_text, recipient_text, has_real_job, config.user_identity.name, company_level=company_level
+    )
+    if grounding:
+        return fail([f"Ungrounded statement: {g}" for g in grounding])
+
+    min_words, max_words = word_target(app.persona, *_word_range(config, app))
+    style_issues = check_email_style(email.body, config.user_identity.name, min_words, max_words)
+    if company_level and config.company_outreach.ask_about_openings:
+        style_issues += check_company_inquiry(email.body, config.user_identity.name)
+    recent_bodies = [e.body for e in _recent_initial_emails(session, app.id)]
+    style_issues += check_voice(email.body, recent_bodies, config.user_identity.name)
+    style_issues += check_subject(email.subject, [e.subject for e in _recent_initial_emails(session, app.id)])
     if style_issues:
         already_retried = (
             session.query(History)
@@ -1981,6 +2366,13 @@ def run_stage_9_validation(
         )
         if already_retried < MAX_VALIDATION_RETRIES:
             return fail(style_issues)
+        simplified = simplify_jargon(email.body, _cached_plain_highlights(session, config, app), config.user_identity.name)
+        if simplified != email.body:
+            email.body = simplified
+            session.add(History(application_id=app.id, stage=9, state="Validation", run_id=run_id,
+                                notes="Replaced a tech-stack sentence with the plain summary of the same experience."))
+            still_jargon = [i for i in check_voice(email.body, [], config.user_identity.name) if "tech-stack" in i]
+            style_issues = [i for i in style_issues if "tech-stack" not in i] + still_jargon
         p_log.warning(f"Style issues remain after rewrite (not blocking): {style_issues}")
 
     base_resume_path = rv.parent_resume if os.path.exists(rv.parent_resume) else config.pipeline.base_resume_path
@@ -2004,10 +2396,21 @@ def run_stage_9_validation(
         f"1. There are absolutely no template placeholders like '[Insert Name]', '[Your Name]', '<Company>', 'YYYY', etc.\n"
         f"2. Every claim about the CANDIDATE (employers, titles, projects, degrees, certifications, skills, metrics, "
         f"location/relocation, availability, visa) is supported by the Base Resume.\n"
-        f"Do NOT flag: the recipient company, its products, funding or news, the recipient's name/role, the sender "
-        f"identity links above, or the candidate saying they are seeking an internship/role (that is the purpose of "
-        f"the email). These are not claims about the candidate's background.\n"
-        f"Return a structured result: is_valid (boolean) and a list of errors (only real violations)."
+        f"3. Every statement about the company (its products, posts, news, technology, needs or priorities) is "
+        f"supported by the company context below; no invented job opening and no invented relationship with the "
+        f"recipient or the hiring team.\n"
+        f"Company context: {company.description or ''} {json.dumps(company.research_data or {})[:2500]} "
+        f"{json.dumps(company.recent_news or [])[:800]}\n"
+        + (
+            "This is a company-level inquiry: NO opening is known at this company. Flag any sentence that claims or "
+            "implies a specific opening exists or states the company's hiring plans.\n"
+            if company_level
+            else ""
+        )
+        + "Do NOT flag: the recipient company, its products, funding or news, the recipient's name/role, the sender "
+        "identity links above, or the candidate saying they are seeking an internship/role (that is the purpose of "
+        "the email). These are not claims about the candidate's background.\n"
+        "Return a structured result: is_valid (boolean) and a list of errors (only real violations)."
     )
 
     try:
@@ -2091,8 +2494,13 @@ def run_stage_10_gmail_draft_creation(
 
     if contact.do_not_contact:
         return stop("Do Not Contact", f"{contact.name} is marked do-not-contact.")
-    if email.gmail_draft_id is None and recipient_already_contacted(session, contact.email, exclude_app_id=app.id):
-        return stop("Duplicate", f"{contact.email} was already contacted by another application.")
+    allow_multi = config is not None and config.contacts.max_contacts_per_company > 1
+    if email.gmail_draft_id is None:
+        if recipient_already_contacted(session, contact.email, exclude_app_id=app.id):
+            return stop("Duplicate", f"{contact.email} was already contacted by another application.")
+        duplicate = find_duplicate(session, app, contact, contact.email, allow_multi)
+        if duplicate:
+            return stop("Duplicate", f"Duplicate outreach blocked: {duplicate}.")
     can_read = getattr(gmail, "can_read", None)
     if (
         email.gmail_draft_id is None
@@ -2101,10 +2509,13 @@ def run_stage_10_gmail_draft_creation(
         and callable(can_read)
     ):
         try:
-            if can_read() and gmail.search_messages(f"in:sent to:{contact.email}", 1):
-                return stop("Duplicate", f"Already emailed {contact.email} from Gmail (found in Sent mail).")
+            if can_read():
+                if gmail.search_messages(f"(in:sent OR in:drafts) to:{contact.email}", 1):
+                    return stop("Duplicate", f"{contact.email} already has a sent email or draft in Gmail.")
+                if company.domain and not allow_multi and gmail.search_messages(f"(in:sent OR in:drafts) to:{company.domain}", 1):
+                    return stop("Duplicate", f"Gmail already has a sent email or draft to someone at {company.domain}.")
         except Exception as e:
-            p_log.info(f"Gmail sent-history check skipped: {e}")
+            p_log.info(f"Gmail history check skipped: {e}")
 
     try:
         if email.gmail_draft_id is None:
@@ -2136,6 +2547,7 @@ def run_stage_10_gmail_draft_creation(
             app.outreach_status = "scheduled"
             note += f" Scheduled to send at {email.scheduled_at:%Y-%m-%d %H:%M} UTC."
 
+        record_outreach(session, app, contact, contact.email, "scheduled" if email.status == "scheduled" else "drafted")
         log_event(session, app.id, "drafted", email.id, details=note)
         app.current_stage = 11
         app.state = "Database Finalization"

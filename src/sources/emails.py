@@ -5,6 +5,13 @@ Evidence (highest confidence first): address supplied by a source (Hunter/Apollo
 the company site or in commits -> company pattern inferred from known addresses -> Hunter/Apollo finders ->
 LLM reading search results -> common-pattern permutations.
 Verification: SMTP RCPT probe with catch-all detection, then Hunter's verifier, then evidence-weighted acceptance.
+
+Every result carries a confidence level and a human-readable evidence string:
+  verified         mail server (or Hunter's verifier) confirmed the mailbox on a non-catch-all domain
+  high_confidence  address found explicitly (Hunter, Apollo, company pages, public commits, search results)
+  pattern_match    company's email pattern learned from other employees' real addresses
+  catch_all        domain accepts any address, so the mailbox cannot be confirmed
+  guessed          common naming pattern / LLM guess with no supporting evidence
 """
 
 import logging
@@ -32,6 +39,9 @@ from src.utils.email_verifier import (
 
 logger = logging.getLogger("recruiting-platform.sources.emails")
 
+CONFIDENCE_LEVELS = ("verified", "high_confidence", "pattern_match", "catch_all", "guessed")
+_HIGH_CONFIDENCE_SOURCES = {"hunter", "apollo", "website", "github", "team_page", "provided", "source"}
+
 
 @dataclass
 class EmailResult:
@@ -43,6 +53,23 @@ class EmailResult:
     catch_all: bool | None = None
     pattern: str | None = None
     rejected: list[str] = field(default_factory=list)
+    level: str = "guessed"  # verified | high_confidence | pattern_match | catch_all | guessed
+    evidence: str = ""
+
+    def as_evidence(self) -> dict[str, str | None]:
+        return {"email": self.email, "confidence": self.level, "evidence": self.evidence}
+
+
+def confidence_level(status: str, source: str, confidence: float) -> str:
+    if status == "valid":
+        return "verified"
+    if status == "catch_all":
+        return "catch_all"
+    if source in _HIGH_CONFIDENCE_SOURCES or (source == "llm" and confidence >= 0.85):
+        return "high_confidence"
+    if source == "pattern":
+        return "pattern_match"
+    return "guessed"
 
 
 def _llm_guess(
@@ -103,9 +130,10 @@ def find_contact_email(
     if not verify_domain_mx(domain):
         return EmailResult(None, "invalid", 0.0, "mx", f"Domain '{domain}' has no MX records")
 
-    candidates: dict[str, tuple[float, str]] = {}
+    # email -> (confidence, source, evidence)
+    candidates: dict[str, tuple[float, str, str]] = {}
 
-    def add(email: str | None, confidence: float, source: str) -> None:
+    def add(email: str | None, confidence: float, source: str, evidence: str) -> None:
         if not email:
             return
         email = email.strip().lower()
@@ -115,18 +143,19 @@ def find_contact_email(
         if email_domain != domain and not email_domain.endswith("." + domain):
             return
         if email not in candidates or candidates[email][0] < confidence:
-            candidates[email] = (confidence, source)
+            candidates[email] = (confidence, source, evidence)
 
     placeholder = is_placeholder_name(contact_name)
     observed = [e.lower() for e in (observed_emails or [])]
     samples = list(email_samples or [])
 
-    add(hint_email, hint_confidence or 0.7, hint_source)
+    hint_conf = hint_confidence or 0.7
+    add(hint_email, hint_conf, hint_source, f"provided by {hint_source} (confidence {hint_conf:.2f})")
 
     if placeholder:
         for email in observed:
             if email.split("@")[0] in GENERIC_INBOXES:
-                add(email, 0.65, "website")
+                add(email, 0.65, "website", "hiring inbox listed on the company website")
     else:
         parts = normalize_name_parts(contact_name)
         first, last = (parts[0], parts[-1]) if len(parts) > 1 else (parts[0] if parts else "", "")
@@ -135,7 +164,7 @@ def find_contact_email(
         if hunter_key and first and last:
             try:
                 found, score = HunterClient(browser, hunter_key).email_finder(domain, first, last)
-                add(found, max(0.5, score), "hunter")
+                add(found, max(0.5, score), "hunter", f"Hunter email-finder (score {score:.0%})")
             except Exception as e:
                 logger.info(f"Hunter email finder failed for {contact_name}: {e}")
 
@@ -143,30 +172,45 @@ def find_contact_email(
         if apollo_key and first and last:
             try:
                 found, score = ApolloClient(browser, apollo_key).match_person(first, last, domain)
-                add(found, score, "apollo")
+                add(found, score, "apollo", "Apollo people match")
             except Exception as e:
                 logger.info(f"Apollo match failed for {contact_name}: {e}")
 
         pattern, pattern_conf = known_pattern, 0.8 if known_pattern else 0.0
+        pattern_origin = "known company pattern (Hunter or a previously verified address)"
         if not pattern and samples:
             pattern, pattern_conf = infer_email_pattern(samples, domain)
+            if pattern:
+                matches = sum(1 for name, email in samples if apply_pattern(pattern, name, domain) == email.lower())
+                pattern_origin = f"matched from {matches} employee email(s) found in public sources"
         if pattern:
-            add(apply_pattern(pattern, contact_name, domain), max(0.6, min(0.9, 0.6 + 0.3 * pattern_conf)), "pattern")
+            add(
+                apply_pattern(pattern, contact_name, domain),
+                max(0.6, min(0.9, 0.6 + 0.3 * pattern_conf)),
+                "pattern",
+                f"pattern {pattern} {pattern_origin}",
+            )
 
         for email, _prior in rank_email_candidates(contact_name, domain):
             if email in observed:
-                add(email, 0.9, "website")
+                add(email, 0.9, "website", "address printed on company pages or public commits")
 
-        if max((c for c, _s in candidates.values()), default=0.0) < 0.6:
+        if max((c for c, _s, _e in candidates.values()), default=0.0) < 0.6:
             try:
                 guess, scraped = _llm_guess(llm, browser, contact_name, company, domain)
                 if guess:
-                    add(guess, 0.85 if guess.lower() in scraped.lower() else 0.45, "llm")
+                    in_text = guess.lower() in scraped.lower()
+                    add(
+                        guess,
+                        0.85 if in_text else 0.45,
+                        "llm",
+                        "address appears in search results" if in_text else "LLM guess from name and domain",
+                    )
             except Exception as e:
                 logger.warning(f"LLM failed to deduce email for {contact_name}: {e}")
 
     for email, prior in rank_email_candidates(contact_name, domain, pattern_confidence=0.0):
-        add(email, prior, "permutation")
+        add(email, prior, "permutation", f"common corporate pattern (prior {prior:.0%})")
 
     ranked = sorted(candidates.items(), key=lambda kv: kv[1][0], reverse=True)
     if not ranked:
@@ -175,6 +219,16 @@ def find_contact_email(
     inferred_pattern = known_pattern or (infer_email_pattern(samples, domain)[0] if samples else None)
     newly_rejected: list[str] = []
     catch_all = accept_all_hint
+    smtp_note = "SMTP check disabled"
+
+    def result(
+        email: str, status: str, conf: float, source: str, evidence: str, is_catch_all: bool | None
+    ) -> EmailResult:
+        level = confidence_level(status, source, conf)
+        return EmailResult(
+            email, status, round(conf, 2), source, evidence, is_catch_all, inferred_pattern, newly_rejected, level,
+            evidence,
+        )
 
     # 1. SMTP probe (single session: catch-all test + candidates)
     if verification.smtp_check:
@@ -186,11 +240,12 @@ def find_contact_email(
             helo_host=verification.helo_host,
             timeout=verification.smtp_timeout,
         )
+        smtp_note = probe.detail or "SMTP inconclusive"
         if probe.catch_all is not None:
             catch_all = probe.catch_all
             company.is_catch_all = probe.catch_all
         if probe.catch_all is False:
-            for email, (_conf, source) in ranked:
+            for email, (_conf, source, evidence) in ranked:
                 res = probe.results.get(email)
                 if res is None:
                     continue
@@ -199,48 +254,60 @@ def find_contact_email(
                         pattern, _ = infer_email_pattern([(contact_name, email)], domain)
                         if pattern and not company.email_pattern:
                             company.email_pattern = pattern
-                    return EmailResult(email, "valid", 0.97, source, f"SMTP accepted ({res.code})", False, pattern=inferred_pattern)
+                    return result(
+                        email, "valid", 0.97, source,
+                        f"SMTP {probe.detail}: mailbox accepted ({res.code}) and a random address was rejected, "
+                        f"so the domain is not catch-all. Found via: {evidence}",
+                        False,
+                    )
                 if res.status == "invalid":
                     newly_rejected.append(email)
             ranked = [(e, v) for e, v in ranked if e not in newly_rejected]
             if not ranked:
-                return EmailResult(None, "invalid", 0.0, "smtp", "all candidates rejected by mail server", False, rejected=newly_rejected)
+                return EmailResult(
+                    None, "invalid", 0.0, "smtp", "all candidates rejected by mail server", False, rejected=newly_rejected
+                )
 
     if catch_all:
-        email, (conf, source) = ranked[0]
+        email, (conf, source, evidence) = ranked[0]
         if verification.allow_catch_all and conf >= verification.min_confidence:
-            return EmailResult(
-                email, "catch_all", round(min(conf, 0.8), 2), source,
-                "domain accepts all addresses; chose strongest evidence", True, inferred_pattern, newly_rejected,
+            return result(
+                email, "catch_all", min(conf, 0.8), source,
+                f"Domain accepts any address (catch-all); chose the strongest evidence: {evidence}", True,
             )
-        return EmailResult(None, "catch_all", conf, source, "catch-all domain and catch-all disallowed", True, rejected=newly_rejected)
+        return EmailResult(
+            None, "catch_all", conf, source, "catch-all domain and catch-all disallowed", True, rejected=newly_rejected
+        )
 
     # 2. Hunter verifier when SMTP was inconclusive
     hunter_key = config.api_keys.get("hunter")
     if hunter_key:
-        for email, (conf, source) in ranked[:2]:
+        for email, (conf, source, evidence) in ranked[:2]:
             try:
                 status = HunterClient(browser, hunter_key).verify(email)
             except Exception as e:
                 logger.info(f"Hunter verification failed for {email}: {e}")
                 break
             if status == "valid":
-                return EmailResult(email, "valid", 0.95, source, "Hunter verified", catch_all, inferred_pattern, newly_rejected)
+                return result(email, "valid", 0.95, source, f"Hunter verifier: deliverable. Found via: {evidence}", catch_all)
             if status == "catch_all":
-                return EmailResult(email, "catch_all", round(min(conf, 0.8), 2), source, "Hunter: accept-all", True, inferred_pattern, newly_rejected)
+                return result(
+                    email, "catch_all", min(conf, 0.8), source, f"Hunter verifier: accept-all domain. Found via: {evidence}", True
+                )
             if status == "invalid":
                 newly_rejected.append(email)
         ranked = [(e, v) for e, v in ranked if e not in newly_rejected]
 
     # 3. Evidence-weighted acceptance (SMTP unavailable/greylisted)
     if ranked and verification.allow_unverified:
-        email, (conf, source) = ranked[0]
+        email, (conf, source, evidence) = ranked[0]
         if conf >= verification.min_confidence:
-            return EmailResult(
-                email, "unverified", round(conf, 2), source,
-                "mailbox could not be verified; best evidence-backed candidate", catch_all, inferred_pattern, newly_rejected,
+            return result(
+                email, "unverified", conf, source, f"Mailbox not verifiable ({smtp_note}); found via: {evidence}", catch_all
             )
-    return EmailResult(None, "unknown", 0.0, "none", "no candidate met the confidence threshold", catch_all, rejected=newly_rejected)
+    return EmailResult(
+        None, "unknown", 0.0, "none", "no candidate met the confidence threshold", catch_all, rejected=newly_rejected
+    )
 
 
 def verification_timestamp() -> datetime:

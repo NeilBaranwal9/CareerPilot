@@ -9,6 +9,23 @@ def utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
+# Application.outreach_type: "job" = outreach about a real discovered/pasted opening; "company_speculative" = a
+# company-level inquiry about current/upcoming internships when no matching public opening exists.
+OUTREACH_JOB = "job"
+OUTREACH_COMPANY = "company_speculative"
+# Job.source of the placeholder row that anchors a company-level inquiry (Application.job_id is required). Its title
+# is COMPANY_OUTREACH_TITLE, never a role name, and it never claims that an opening exists.
+COMPANY_OUTREACH_SOURCE = "company_outreach"
+COMPANY_OUTREACH_TITLE = "Company-level internship inquiry"
+# Sources that do not represent a public opening. "speculative" rows were created by older versions (a role title plus
+# "(Speculative Application)"); they are no longer created and keep their old handling.
+NON_OPENING_SOURCES = (None, COMPANY_OUTREACH_SOURCE, "speculative")
+
+
+def outreach_type_for(job_source: str | None) -> str:
+    return OUTREACH_COMPANY if job_source == COMPANY_OUTREACH_SOURCE else OUTREACH_JOB
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -104,7 +121,8 @@ class Job(Base):
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     location: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
-    # greenhouse, lever, ashby, workable, smartrecruiters, linkedin, wellfound, indeed, career_page, speculative, pasted
+    # greenhouse, lever, ashby, workable, smartrecruiters, linkedin, wellfound, indeed, career_page, pasted,
+    # company_outreach (company-level inquiry, not an opening), speculative (legacy)
     source: Mapped[str | None] = mapped_column(String, nullable=True)
     posted_at: Mapped[str | None] = mapped_column(String, nullable=True)
 
@@ -137,6 +155,9 @@ class Contact(Base):
     email_confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
     email_source: Mapped[str | None] = mapped_column(String, nullable=True)
     email_verified_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # verified | high_confidence | pattern_match | catch_all | guessed
+    email_confidence_level: Mapped[str | None] = mapped_column(String, nullable=True)
+    email_evidence: Mapped[str | None] = mapped_column(Text, nullable=True)
     rejected_emails: Mapped[Any | None] = mapped_column(JSON, nullable=True)  # bounced / invalid addresses
     do_not_contact: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     last_contacted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -162,6 +183,8 @@ class Application(Base):
 
     campaign_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("campaigns.id"), nullable=True, index=True)
     persona: Mapped[str | None] = mapped_column(String, nullable=True)
+    # job | company_speculative (see OUTREACH_JOB / OUTREACH_COMPANY); NULL on rows created before this column existed
+    outreach_type: Mapped[str | None] = mapped_column(String, nullable=True)
     # drafted, scheduled, sent, followed_up, replied, interview, not_interested, bounced, no_response, offer, rejected
     outreach_status: Mapped[str | None] = mapped_column(String, nullable=True)
     sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -178,6 +201,12 @@ class Application(Base):
     resume_versions: Mapped[list["ResumeVersion"]] = relationship(back_populates="application")
     history_records: Mapped[list["History"]] = relationship(back_populates="application")
     events: Mapped[list["OutreachEvent"]] = relationship(back_populates="application")
+
+    @property
+    def is_company_level(self) -> bool:
+        """True for a company-level (speculative) inquiry; older rows fall back to the job's source."""
+        kind = self.outreach_type or outreach_type_for(self.job.source if self.job is not None else None)
+        return kind == OUTREACH_COMPANY
 
 
 class Email(Base):
@@ -200,6 +229,7 @@ class Email(Base):
     gmail_message_id: Mapped[str | None] = mapped_column(String, nullable=True)
     gmail_thread_id: Mapped[str | None] = mapped_column(String, nullable=True)
     rfc_message_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    opening_style: Mapped[str | None] = mapped_column(String, nullable=True)  # used to vary consecutive emails
     sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     application: Mapped[Application] = relationship(back_populates="emails")
@@ -251,6 +281,44 @@ class OutreachEvent(Base):
     details: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     application: Mapped[Application] = relationship(back_populates="events")
+
+
+class LLMUsage(Base):
+    """Token accounting per LLM call (task/stage, tier, provider, model)."""
+
+    __tablename__ = "llm_usage"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
+    run_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    task: Mapped[str] = mapped_column(String, index=True)  # discovery, research, contact_finding, ...
+    tier: Mapped[str] = mapped_column(String)  # local | premium | premium_fast
+    provider: Mapped[str] = mapped_column(String)  # ollama | groq | ...
+    model: Mapped[str | None] = mapped_column(String, nullable=True)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    total_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    estimated: Mapped[bool] = mapped_column(Boolean, default=False)
+    success: Mapped[bool] = mapped_column(Boolean, default=True)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class OutreachLedger(Base):
+    """One row per outreach thread started (draft created). Used to block duplicate company/role/contact/email."""
+
+    __tablename__ = "outreach_ledger"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    application_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("applications.id"), nullable=True, index=True)
+    company_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    company_key: Mapped[str] = mapped_column(String, index=True)
+    company_domain: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    role_key: Mapped[str] = mapped_column(String, index=True)
+    contact_key: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    contact_name: Mapped[str | None] = mapped_column(String, nullable=True)
+    email: Mapped[str] = mapped_column(String, index=True)
+    status: Mapped[str] = mapped_column(String, default="drafted")  # drafted | sent | replied | cancelled
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class CacheEntry(Base):

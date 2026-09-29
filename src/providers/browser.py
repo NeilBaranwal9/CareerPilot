@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import sys
 import time
 import urllib.parse
 from typing import Any
@@ -25,6 +26,15 @@ HEADERS = {
 }
 
 
+class FetchError(RuntimeError):
+    """HTTP fetch failure with the status code (None for network errors)."""
+
+    def __init__(self, url: str, status: int | None, message: str):
+        super().__init__(message)
+        self.url = url
+        self.status = status
+
+
 class BrowserProvider:
     """
     Scraping and search provider. Integrates both httpx (lightweight) and Playwright (JS dynamic).
@@ -40,6 +50,10 @@ class BrowserProvider:
         self.min_search_interval = 1.0
         self._last_search_at = 0.0
         self._search_cache: dict[tuple[str, int, bool], list[dict[str, str]]] = {}
+        self._playwright_ready: bool | None = None
+        self.playwright_message = ""
+        self._playwright_warned = False
+        self._ddg_blocked_until = 0.0
         self._load_domain_stats()
 
     def configure_search(
@@ -115,6 +129,10 @@ class BrowserProvider:
             for r in data.get("web", {}).get("results", [])
             if r.get("url")
         ]
+
+    def is_disabled(self, domain: str) -> bool:
+        """True for a disabled domain or any of its subdomains (e.g. in.linkedin.com for linkedin.com)."""
+        return any(domain == d or domain.endswith("." + d) for d in self.disabled_domains)
 
     def _get_domain(self, url: str) -> str:
         """Helper to extract clean domain name from URL."""
@@ -201,32 +219,70 @@ class BrowserProvider:
         self._save_domain_stats()
 
     def fetch_page_http(self, url: str) -> str:
-        """Fetches page content using curl_cffi with Chrome 120 TLS impersonation, falling back to httpx."""
-        try:
-            from curl_cffi import requests as curl_requests
+        """
+        Fetches page content using curl_cffi with Chrome 120 TLS impersonation, falling back to httpx.
+        429/503 responses get one retry after a short backoff (Retry-After honoured up to 10s).
+        Raises FetchError carrying the HTTP status (None for network errors).
+        """
+        status: int | None = None
+        last_error: Exception | None = None
+        for attempt in range(2):
+            status, retry_after = None, None
+            try:
+                from curl_cffi import requests as curl_requests
 
-            response = curl_requests.get(
-                url,
-                headers=HEADERS,
-                impersonate="chrome120",
-                timeout=15,
-                verify=False,
-                allow_redirects=True,
-            )
-            if response.status_code < 400:
-                return response.text
-        except Exception as ce:
-            logger.debug(f"curl_cffi fetch failed for {url}: {ce}")
+                response = curl_requests.get(
+                    url, headers=HEADERS, impersonate="chrome120", timeout=15, verify=False, allow_redirects=True
+                )
+                if response.status_code < 400:
+                    return str(response.text)
+                status, retry_after = response.status_code, response.headers.get("Retry-After")
+            except Exception as ce:
+                last_error = ce
+                logger.debug(f"curl_cffi fetch failed for {url}: {ce}")
 
-        try:
-            with httpx.Client(headers=HEADERS, follow_redirects=True, timeout=15.0, verify=False) as client:
-                httpx_resp = client.get(url)
-                if httpx_resp.status_code < 400:
-                    return httpx_resp.text
-                raise RuntimeError(f"HTTP fetch returned status {httpx_resp.status_code}")
-        except Exception as e:
-            logger.warning(f"HTTP fetch failed for {url}: {e}")
-            raise RuntimeError(f"HTTP request to {url} failed: {e}") from e
+            if status is None or status >= 500:
+                try:
+                    with httpx.Client(headers=HEADERS, follow_redirects=True, timeout=15.0, verify=False) as client:
+                        httpx_resp = client.get(url)
+                    if httpx_resp.status_code < 400:
+                        return httpx_resp.text
+                    status, retry_after = httpx_resp.status_code, httpx_resp.headers.get("Retry-After")
+                except Exception as e:
+                    last_error = e
+
+            if status in (429, 503) and attempt == 0:
+                try:
+                    wait = min(float(retry_after), 10.0) if retry_after else 3.0
+                except ValueError:
+                    wait = 3.0
+                logger.info(f"HTTP {status} from {url}; retrying in {wait:.0f}s")
+                time.sleep(wait)
+                continue
+            break
+        reason = f"status {status}" if status else f"network error: {last_error}"
+        logger.debug(f"HTTP fetch failed for {url}: {reason}")
+        raise FetchError(url, status, f"HTTP request to {url} failed ({reason})")
+
+    def playwright_status(self) -> tuple[bool, str]:
+        """(ready, message). Checked once per process; used to skip Playwright when its browser is not installed."""
+        if self._playwright_ready is None:
+            fix = f'"{sys.executable}" -m playwright install chromium'
+            try:
+                from playwright.sync_api import sync_playwright
+
+                with sync_playwright() as p:
+                    path = p.chromium.executable_path
+                self._playwright_ready = bool(path) and os.path.exists(path)
+                self.playwright_message = (
+                    "Playwright Chromium ready"
+                    if self._playwright_ready
+                    else f"Playwright browser is not installed (JS-heavy pages will be skipped). Fix: {fix}"
+                )
+            except Exception as e:
+                self._playwright_ready = False
+                self.playwright_message = f"Playwright unavailable ({e}). Fix: {fix}"
+        return bool(self._playwright_ready), self.playwright_message
 
     def fetch_page_playwright(self, url: str) -> str:
         """
@@ -250,14 +306,17 @@ class BrowserProvider:
 
     def fetch_page(self, url: str, use_playwright: bool = False) -> str:
         """
-        Fetches page using either Playwright or direct HTTP.
-        If direct HTTP fails, automatically falls back to Playwright.
+        Fetches a page over HTTP; falls back to Playwright (if installed) for network errors and 5xx responses.
+        404/410 are "page not found" (no penalty); 403/429/999 count towards the domain circuit breaker.
         """
         domain = self._get_domain(url)
-        if domain in self.disabled_domains:
+        if self.is_disabled(domain):
             raise RuntimeError(f"Domain {domain} is disabled due to previous failures.")
 
         if use_playwright:
+            ready, message = self.playwright_status()
+            if not ready:
+                raise RuntimeError(message)
             try:
                 res = self.fetch_page_playwright(url)
                 self._record_success(domain)
@@ -274,14 +333,21 @@ class BrowserProvider:
             res = self.fetch_page_http(url)
             self._record_success(domain)
             return res
-        except Exception as e:
-            err_msg = str(e).lower()
-            status_blocked = "403" in err_msg or "429" in err_msg or "forbidden" in err_msg or "too many requests" in err_msg
-
-            if is_block_heavy or status_blocked:
+        except FetchError as e:
+            if e.status in (404, 410):
+                raise  # a missing page says nothing about the site's health
+            if is_block_heavy or e.status in (401, 403, 429, 999):
                 self._record_failure(domain)
-                logger.warning(f"HTTP fetch failed for {url} ({e}). Skipping Playwright retry for block-heavy/blocked resource.")
-                raise RuntimeError(f"Failed to fetch page {url} (blocked/hostile)") from e
+                logger.info(f"{url} blocked or rate limited (status {e.status}); not retrying.")
+                raise RuntimeError(f"Failed to fetch page {url} (blocked/hostile, status {e.status})") from e
+
+            ready, message = self.playwright_status()
+            if not ready:
+                if not self._playwright_warned:
+                    logger.warning(message)
+                    self._playwright_warned = True
+                self._record_failure(domain)
+                raise RuntimeError(f"Failed to fetch page {url} ({e}); Playwright fallback unavailable") from e
 
             logger.info(f"Direct HTTP fetch failed for {url} ({e}). Retrying with Playwright...")
             try:
@@ -290,7 +356,7 @@ class BrowserProvider:
                 return res
             except Exception as pe:
                 self._record_failure(domain)
-                logger.error(f"Both HTTP and Playwright fetch failed for {url}: {pe}")
+                logger.warning(f"Both HTTP and Playwright fetch failed for {url}: {pe}")
                 raise RuntimeError(f"Failed to fetch page {url}") from pe
 
     def extract_text(self, html: str) -> str:
@@ -341,7 +407,7 @@ class BrowserProvider:
                     else self._search_brave(query, num_results)
                 )
                 for r in api_results:
-                    if not include_blocked and self._get_domain(r["url"]) in self.disabled_domains:
+                    if not include_blocked and self.is_disabled(self._get_domain(r["url"])):
                         continue
                     results.append(r)
                     if len(results) >= num_results:
@@ -352,9 +418,15 @@ class BrowserProvider:
                 self._search_cache[cache_key] = list(results)
                 return results
 
-        # 1. Try DuckDuckGo
+        # 1. Try DuckDuckGo (skipped for 15 minutes after it serves a bot challenge)
         try:
+            if time.monotonic() < self._ddg_blocked_until:
+                raise RuntimeError("DuckDuckGo temporarily skipped after a bot challenge")
             html = self.fetch_page_http(url)
+            if "anomaly" in html.lower() and "challenge" in html.lower():
+                self._ddg_blocked_until = time.monotonic() + 900
+                logger.warning("DuckDuckGo served a bot challenge; using Yahoo for the next 15 minutes.")
+                raise RuntimeError("DuckDuckGo bot challenge")
             soup = BeautifulSoup(html, "html.parser")
 
             # DuckDuckGo HTML layout
@@ -384,7 +456,7 @@ class BrowserProvider:
 
                 # Filter out disabled domains
                 domain = self._get_domain(href)
-                if not include_blocked and domain in self.disabled_domains:
+                if not include_blocked and self.is_disabled(domain):
                     continue
 
                 snippet = link.get_text().strip()
@@ -417,7 +489,7 @@ class BrowserProvider:
                             
                             # Filter out disabled domains
                             domain = self._get_domain(dest_url)
-                            if not include_blocked and domain in self.disabled_domains:
+                            if not include_blocked and self.is_disabled(domain):
                                 continue
 
                             title = a.get_text().strip()

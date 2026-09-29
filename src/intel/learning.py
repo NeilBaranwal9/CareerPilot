@@ -4,6 +4,7 @@ reply-rate multipliers, which feed company fit, contact ranking and response-pro
 """
 
 from dataclasses import dataclass, field
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -24,6 +25,10 @@ PERSONA_PRIORS: dict[str, float] = {
     "founder": 1.3,
     "hiring_manager": 1.25,
     "engineering_manager": 1.15,
+    "product_manager": 1.15,
+    "product_lead": 1.1,
+    "data_lead": 1.05,
+    "qa_lead": 1.0,
     "recruiter": 1.15,
     "cto": 0.95,
     "vp_engineering": 0.85,
@@ -147,6 +152,82 @@ def persona_multiplier(persona: str | None, employee_count: int | None, stats: O
 
 EMAIL_STATUS_FACTOR = {"valid": 1.0, "catch_all": 0.8, "unverified": 0.7, "unknown": 0.6, "invalid": 0.0}
 
+# Probability the email reaches a real inbox, by confidence level (legacy statuses mapped too).
+DELIVERABILITY = {
+    "verified": 0.97, "high_confidence": 0.9, "pattern_match": 0.78, "catch_all": 0.65, "guessed": 0.45,
+    "valid": 0.97, "provided": 0.95, "unverified": 0.6, "unknown": 0.5, "invalid": 0.0,
+}
+COMPONENT_WEIGHTS = {"company_fit": 0.3, "hiring_signal": 0.2, "contact_seniority": 0.3, "resume_match": 0.2}
+
+
+def hiring_signal_score(company: Company, relevant_job: bool | None = None) -> float:
+    if relevant_job:
+        return 1.0
+    return {"hiring": 0.8, "no_public_openings": 0.4}.get(company.hiring_status or "", 0.55)
+
+
+def contact_seniority_score(persona: str | None, company: Company, stats: OutcomeStats | None) -> float:
+    """How likely this kind of person is to reply and able to help, 0..1 (priors adjusted for company size)."""
+    if not persona:
+        return 0.7
+    headcount = effective_headcount(company.employee_count, company.funding_stage)
+    return round(min(1.0, persona_multiplier(persona, headcount, stats) / 1.5), 3)
+
+
+def explain_reply_probability(
+    company: Company,
+    stats: OutcomeStats,
+    persona: str | None = None,
+    email_level: str | None = None,
+    resume_match: float | None = None,
+    relevant_job: bool | None = None,
+) -> dict[str, Any]:
+    """
+    Transparent reply-probability estimate:
+      P(reply) = deliverability x base_rate x engagement_multiplier x learned_multiplier
+    where engagement_multiplier = 0.4 + 2.2 x weighted(company_fit, hiring_signal, contact_seniority, resume_match).
+    """
+    components = {
+        "company_fit": round(company.fit_score if company.fit_score is not None else 0.5, 3),
+        "hiring_signal": round(hiring_signal_score(company, relevant_job), 3),
+        "contact_seniority": contact_seniority_score(persona, company, stats if stats.total_sent else None),
+        "resume_match": round(resume_match if resume_match is not None else 0.6, 3),
+    }
+    engagement = sum(components[k] * w for k, w in COMPONENT_WEIGHTS.items())
+    engagement_multiplier = 0.4 + 2.2 * engagement
+    learned = (
+        stats.multiplier("sector", company.sector or "generic")
+        * stats.multiplier("funding_stage", company.funding_stage or "unknown")
+        * stats.multiplier("size_bucket", size_bucket(company.employee_count))
+    )
+    if persona:
+        learned *= stats.multiplier("persona", persona)
+    learned = max(0.4, min(2.5, learned))
+    deliverability = DELIVERABILITY.get(email_level or "", 0.8 if email_level is None else 0.5)
+    base = stats.global_rate
+    final = max(0.005, min(0.6, deliverability * base * engagement_multiplier * learned))
+    components["email_confidence"] = round(deliverability, 3)
+    lines = [
+        f"Company Fit: {components['company_fit']:.2f}",
+        f"Hiring Signal: {components['hiring_signal']:.2f}",
+        f"Contact Seniority: {components['contact_seniority']:.2f}",
+        f"Email Confidence: {components['email_confidence']:.2f}" + (f" ({email_level})" if email_level else " (assumed)"),
+        f"Resume Match: {components['resume_match']:.2f}",
+        f"Base reply rate: {base:.1%} ({'learned from ' + str(stats.total_sent) + ' sent' if stats.total_sent else 'prior'})",
+        f"Engagement multiplier: x{engagement_multiplier:.2f}   Learned multiplier: x{learned:.2f}",
+        f"Final Reply Probability: {final:.1%}",
+    ]
+    return {
+        "components": components,
+        "base_rate": round(base, 4),
+        "engagement": round(engagement, 3),
+        "engagement_multiplier": round(engagement_multiplier, 3),
+        "learned_multiplier": round(learned, 3),
+        "deliverability": round(deliverability, 3),
+        "final": round(final, 4),
+        "explanation": "\n".join(lines),
+    }
+
 
 def estimate_response_probability(
     company: Company,
@@ -154,20 +235,5 @@ def estimate_response_probability(
     persona: str | None = None,
     email_status: str | None = None,
 ) -> float:
-    """Estimated probability that outreach to this company (and persona) gets a human reply."""
-    probability = stats.global_rate
-    probability *= stats.multiplier("sector", company.sector or "generic")
-    probability *= stats.multiplier("funding_stage", company.funding_stage or "unknown")
-    probability *= stats.multiplier("size_bucket", size_bucket(company.employee_count))
-    probability *= stats.multiplier("company_source", company.source or "unknown")
-    if company.hiring_status == "hiring":
-        probability *= 1.2
-    elif company.hiring_status == "no_public_openings":
-        probability *= 0.85
-    if persona:
-        probability *= persona_multiplier(
-            persona, effective_headcount(company.employee_count, company.funding_stage), stats
-        )
-    if email_status:
-        probability *= EMAIL_STATUS_FACTOR.get(email_status, 0.6)
-    return round(max(0.005, min(0.9, probability)), 4)
+    """Estimated probability that outreach to this company (and persona) gets a human reply (see explain_*)."""
+    return float(explain_reply_probability(company, stats, persona=persona, email_level=email_status)["final"])

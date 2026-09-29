@@ -170,8 +170,8 @@ def test_send_followups_and_stop_on_reply(env):
     assert engine.check_replies()["replies"] == 0
 
     funnel = {row["stage"]: row["count"] for row in compute_funnel(session)["funnel"]}
-    assert funnel["Companies Found"] == 1 and funnel["Emails Sent"] == 1
-    assert funnel["Replies"] == 1 and funnel["Interviews"] == 1
+    assert funnel["Discovered"] == 1 and funnel["Sent"] == 1
+    assert funnel["Replied"] == 1 and funnel["Interview"] == 1 and funnel["Rejected"] == 0
     assert email_verification_stats(session)["smtp_verified_pct"] == 100.0
 
 
@@ -233,15 +233,16 @@ def test_email_style_checker():
 
     good = (
         "<p>Hi Priya,</p><p>I saw that PayCo launched instant UPI refunds for small merchants last month.</p>"
-        "<p>I am a third-year AI and ML student at VIT Chennai and interned at Jio Platforms.</p>"
+        "<p>I am an AI and ML student at VIT Chennai and recently interned at Jio Platforms in Mumbai.</p>"
         "<p>There I worked on systems for large-scale telemetry collection and analysis, which is close to the "
         "monitoring a real-time payments product depends on.</p><p>I would love to be considered for relevant "
         "internship opportunities.</p><p>If there is a suitable opening, I would be grateful for a referral or "
-        "any guidance on the right person to contact.</p><p>Best,<br>Neil Baranwal<br>linkedin.com/in/x</p>"
+        "any guidance on the right person to contact on your engineering team.</p>"
+        "<p>Best,<br>Neil Baranwal<br>linkedin.com/in/x</p>"
     )
     assert 80 <= email_body_word_count(good, "Neil Baranwal") <= 180
-    assert check_email_style(good, "Neil Baranwal") == []
+    assert check_email_style(good, "Neil Baranwal", 90, 160) == []
     bad = "<p>Hi Priya, I am passionate about leveraging cutting-edge tech. Can we schedule a quick call?</p>"
-    issues = check_email_style(bad, "Neil Baranwal")
+    issues = check_email_style(bad, "Neil Baranwal", 90, 160)
     assert any("words" in i for i in issues) and any("passionate" in i for i in issues)
     assert any("meeting" in i for i in issues)

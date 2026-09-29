@@ -125,6 +125,10 @@ class StructuredResumeSchema(BaseModel):
     reasoning: str = Field(default="", description="What was reordered/emphasised and why")
 
 
+class PlainSummarySchema(BaseModel):
+    summary: str = Field(description="One plain-language sentence")
+
+
 class EmailGenResponse(BaseModel):
     subject: str = Field(description="Subject line for the outreach email")
     body_html: str = Field(description="HTML formatted email body")

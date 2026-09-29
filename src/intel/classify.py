@@ -173,10 +173,16 @@ _ROLE_RULES: list[tuple[str, list[str]]] = [
     ("recruiter", [
         "recruiter", "recruiting", "talent acquisition", "talent partner", "technical recruiter", "sourcer",
         "people partner", "hr business partner", "human resources", "hr manager", "hr executive", "head of people",
+        "ta", "ta manager", "ta lead", "ta partner", "talent", "campus recruiter",
         "people operations", "talent lead", "hiring partner", "campus hiring", "university recruiting", "hr",
     ]),
     ("founder", ["founder", "co-founder", "cofounder"]),
     ("cto", ["cto", "chief technology officer", "chief technical officer"]),
+    ("product_lead", [
+        "head of product", "vp product", "vp of product", "vice president of product", "director of product",
+        "product director", "chief product officer", "cpo", "product lead", "group product manager",
+        "principal product manager", "lead product manager",
+    ]),
     ("vp_engineering", [
         "vp engineering", "vp of engineering", "vice president engineering", "vice president of engineering",
         "head of engineering", "director of engineering", "engineering director", "head of technology",
@@ -187,11 +193,27 @@ _ROLE_RULES: list[tuple[str, list[str]]] = [
         "engineering manager", "software engineering manager", "manager, engineering", "manager - engineering",
         "development manager", "sde manager", "manager of engineering", "em ", "tech manager", "technical manager",
     ]),
-    ("tech_lead", [
-        "tech lead", "technical lead", "lead engineer", "engineering lead", "staff engineer", "principal engineer",
-        "architect", "team lead",
+    ("product_manager", [
+        "product manager", "associate product manager", "apm", "product owner", "technical product manager",
+        "product management",
     ]),
-    ("executive", ["ceo", "chief executive", "coo", "chief operating", "president", "managing director", "cpo"]),
+    ("data_lead", [
+        "head of data", "data lead", "analytics lead", "head of analytics", "data science manager",
+        "analytics manager", "director of data", "lead data scientist", "director of analytics",
+    ]),
+    ("qa_lead", [
+        "qa lead", "qa manager", "test lead", "head of quality", "quality assurance manager", "sdet lead",
+        "test manager", "quality engineering manager", "head of qa",
+    ]),
+    ("tech_lead", [
+        "tech lead", "technical lead", "lead engineer", "engineering lead", "staff engineer", "staff software engineer",
+        "principal engineer", "architect", "team lead",
+    ]),
+    ("executive", [
+        "ceo", "chief executive", "coo", "chief operating", "president", "managing director", "cfo",
+        "chief financial officer", "chief business officer", "cbo", "cro", "chief revenue officer", "cmo",
+        "chief marketing officer", "chief", "vice president", "vp",
+    ]),
     ("engineer", ["software engineer", "developer", "sde", "engineer", "programmer", "data scientist"]),
     ("generic_inbox", ["generic inbox", "hiring team", "careers inbox", "recruiting (generic"]),
 ]
@@ -215,6 +237,84 @@ def classify_role(title: str | None) -> tuple[str, str]:
     else:
         seniority = "individual"
     return category, seniority
+
+
+# ---------------------------------------------------------------------------
+# Target role families (job-search queries, title matching, company-level outreach)
+# ---------------------------------------------------------------------------
+
+# Checked in order: "QA Engineer" is qa (not software), "AI Engineer" is ai_ml, "Business Intelligence" is data.
+_ROLE_FAMILY_RULES: list[tuple[str, re.Pattern[str]]] = [
+    ("qa", re.compile(r"\b(qa|sdet|test|testing|tester|quality)\b")),
+    ("ai_ml", re.compile(r"\b(ai|ml|machine learning|deep learning|nlp|llm|computer vision|genai)\b")),
+    ("product", re.compile(r"\b(product|apm)\b")),
+    ("data", re.compile(r"\b(data|analytics|business intelligence|bi)\b")),
+    ("business", re.compile(r"\b(business|strategy|operations|consulting|consultant)\b")),
+    ("software", re.compile(
+        r"\b(software|sde|swe|backend|back-end|frontend|front-end|full[ -]?stack|developer|engineer|engineering|"
+        r"programmer|devops|mobile|android|ios|python|java|cloud)\b"
+    )),
+]
+ROLE_FAMILY_LABELS: dict[str, str] = {
+    "product": "product",
+    "data": "data/analytics",
+    "business": "business analysis",
+    "qa": "QA/testing",
+    "software": "software engineering",
+    "ai_ml": "AI/ML",
+}
+# Words that describe seniority/season rather than the role itself.
+_ROLE_NOISE = re.compile(
+    r"\b(intern|interns|internship|trainee|summer|winter|graduate|new grad|entry level|junior|jr|associate)\b|\(.*?\)"
+)
+
+
+def role_family(title: str | None) -> str | None:
+    """'QA Engineer Intern' -> 'qa', 'Product Analyst Intern' -> 'product'; None for e.g. 'Summer Intern'."""
+    lowered = (title or "").lower()
+    for family, pattern in _ROLE_FAMILY_RULES:
+        if pattern.search(lowered):
+            return family
+    return None
+
+
+def role_families(roles: list[str]) -> list[str]:
+    """Distinct families of the configured roles, in the order the roles are listed (first = most preferred)."""
+    families: list[str] = []
+    for role in roles:
+        family = role_family(role)
+        if family and family not in families:
+            families.append(family)
+    return families
+
+
+def role_search_terms(roles: list[str], limit: int = 2) -> list[str]:
+    """
+    Short job-search terms taken from the configured roles: the first role of each of the first `limit` families,
+    without intern/seniority words. ['Product Analyst Intern', 'APM Intern', 'Data Analyst Intern'] ->
+    ['product analyst', 'data analyst']. Empty when no role has a recognisable family (never defaults to engineer).
+    """
+    terms: list[str] = []
+    seen: set[str] = set()
+    for role in roles:
+        family = role_family(role)
+        if not family or family in seen:
+            continue
+        term = " ".join(_ROLE_NOISE.sub(" ", role.lower()).split()).strip(" -,/")
+        if term:
+            seen.add(family)
+            terms.append(term)
+        if len(terms) >= limit:
+            break
+    return terms
+
+
+def describe_role_families(families: list[str], limit: int = 3) -> str:
+    """['product', 'data', 'qa'] -> 'product, data/analytics or QA/testing'."""
+    labels = [ROLE_FAMILY_LABELS.get(f, f) for f in families[:limit]]
+    if len(labels) <= 1:
+        return "".join(labels)
+    return ", ".join(labels[:-1]) + " or " + labels[-1]
 
 
 # ---------------------------------------------------------------------------

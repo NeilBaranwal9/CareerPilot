@@ -65,6 +65,8 @@ def extract_json_block(text: str) -> str:
 
 
 class GroqProvider(BaseLLMProvider):
+    provider_name = "groq"
+
     """
     Groq LLM provider (OpenAI-compatible Chat Completions API at api.groq.com).
 
@@ -148,6 +150,7 @@ class GroqProvider(BaseLLMProvider):
 
                 if response.status_code == 200:
                     data = response.json()
+                    self._add_usage(model, data.get("usage") or {})
                     return str(data["choices"][0]["message"].get("content") or "")
 
                 body = response.text[:500]
@@ -195,11 +198,25 @@ class GroqProvider(BaseLLMProvider):
                 logger.warning(f"{e}. Trying next fallback model.")
         raise RuntimeError("All Groq models failed: " + " | ".join(errors))
 
+    def _reset_usage(self) -> None:
+        self.last_usage = {"prompt_tokens": 0, "completion_tokens": 0, "model": self.model}
+
+    def _add_usage(self, model: str, usage: dict[str, Any]) -> None:
+        if self.last_usage is None:
+            self._reset_usage()
+        assert self.last_usage is not None
+        self.last_usage["prompt_tokens"] = int(self.last_usage["prompt_tokens"]) + int(usage.get("prompt_tokens") or 0)
+        self.last_usage["completion_tokens"] = int(self.last_usage["completion_tokens"]) + int(
+            usage.get("completion_tokens") or 0
+        )
+        self.last_usage["model"] = model
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def generate_text(self, prompt: str, system_prompt: str | None = None) -> str:
+        self._reset_usage()
         messages: list[dict[str, str]] = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -208,6 +225,7 @@ class GroqProvider(BaseLLMProvider):
         return re.sub(r"<think>[\s\S]*?</think>", "", text).strip()
 
     def generate_json(self, prompt: str, schema: type[BaseModel], system_prompt: str | None = None) -> BaseModel:
+        self._reset_usage()
         schema_json = json.dumps(schema.model_json_schema())
         user_prompt = (
             f"{prompt}\n\nReturn ONLY a JSON object that validates against this JSON schema:\n{schema_json}\n"

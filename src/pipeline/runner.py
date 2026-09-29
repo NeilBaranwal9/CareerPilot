@@ -9,12 +9,21 @@ from sqlalchemy.orm import Session
 from src.config import AppConfig, load_config
 from src.db.models import Application, Campaign, Company, Contact, Email, History, Job, Run
 from src.db.session import get_session_factory, init_db
+from src.outreach.dedupe import backfill_ledger
 from src.outreach.engine import OutreachEngine
-from src.pipeline.campaign import campaign_progress, campaign_spec, create_campaign, parse_goal, qualified_company_count
+from src.pipeline.campaign import (
+    campaign_progress,
+    campaign_spec,
+    create_campaign,
+    parse_goal,
+    qualified_company_count,
+    resolve_mode,
+)
 
 # Import stage functions
 from src.pipeline.stages import (
     TERMINAL_STATES,
+    company_outreach_target,
     research_company,
     run_stage_0_company_discovery,
     run_stage_1_job_discovery,
@@ -32,7 +41,8 @@ from src.pipeline.stages import (
 )
 from src.providers.browser import BrowserProvider
 from src.providers.gmail import GmailProvider
-from src.providers.llm import BaseLLMProvider, get_llm_provider
+from src.providers.llm import BaseLLMProvider
+from src.providers.llm.router import LLMRouter, UsageTracker
 from src.scheduler import manage_automation
 from src.sources.companies import DiscoverySpec
 from src.utils.caching import DBCache
@@ -75,11 +85,11 @@ class PipelineRunner:
         self.SessionLocal = get_session_factory(self.config.pipeline.db_path)
 
         # Initialize providers
-        self.llm: BaseLLMProvider = get_llm_provider(self.config.llm)
+        self.usage = UsageTracker(lambda: self.SessionLocal())
+        self.router = LLMRouter(self.config.llm, self.usage)
+        self.llm: BaseLLMProvider = self.router.premium
         self._initial_llm = self.llm
-        self._llm_fast: BaseLLMProvider | None = (
-            get_llm_provider(self.config.llm, fast=True) if self.config.llm.fast_model else None
-        )
+        self._llm_fast: BaseLLMProvider | None = None
         self.browser = BrowserProvider()
         self.browser.configure_search(
             provider=self.config.search.provider,
@@ -93,15 +103,32 @@ class PipelineRunner:
             scopes=self.config.gmail.scopes,
         )
 
+        # Duplicate-prevention ledger must cover drafts created before it existed.
+        with contextlib.suppress(Exception):
+            session = self.SessionLocal()
+            try:
+                backfill_ledger(session)
+            finally:
+                session.close()
+
         # Failsafe: Self-heals background automation if automation=true, or disables it if automation=false
         manage_automation(self.config.pipeline.automation)
 
+    def llm_for(self, task: str) -> BaseLLMProvider:
+        """
+        LLM for a pipeline task, routed by `llm.routing` (local Ollama vs premium Groq) with token accounting.
+        If `llm` was replaced (tests, custom providers), that provider is used for everything.
+        """
+        if self.llm is not self._initial_llm:
+            return self.llm
+        return self.router.get(task)
+
     @property
     def llm_fast(self) -> BaseLLMProvider:
-        """Cheaper model for extraction/classification. Follows `llm` if it was swapped (e.g. in tests)."""
-        if self._llm_fast is not None and self.llm is self._initial_llm:
+        """Backwards-compatible alias: the provider used for cheap extraction work."""
+        if self._llm_fast is not None:
             return self._llm_fast
-        return self.llm
+        return self.llm_for("default")
 
     @llm_fast.setter
     def llm_fast(self, provider: BaseLLMProvider) -> None:
@@ -129,7 +156,28 @@ class PipelineRunner:
         new_run = Run(id=run_id, status="running")
         session.add(new_run)
         session.commit()
+        self.usage.run_id = run_id
+        self._startup_checks(p_log)
         return new_run, p_log
+
+    def _startup_checks(self, p_log: PipelineLogger) -> None:
+        """Surface actionable problems once per process instead of failing silently later."""
+        if getattr(self, "_startup_checked", False):
+            return
+        self._startup_checked = True
+        playwright_status = getattr(self.browser, "playwright_status", None)
+        if callable(playwright_status):
+            ready, message = playwright_status()
+            if not ready:
+                p_log.warning(message)
+        if self.llm is self._initial_llm and self.router.local is not None:
+            if self.router.local_available():
+                p_log.info(f"Local LLM: {self.router.local_status}")
+            else:
+                p_log.warning(
+                    f"Local LLM unavailable: {self.router.local_status}. Local tasks will "
+                    + ("use the Groq fast model within the non-email budget." if self.config.llm.local_fallback == "premium_fast" else "fail.")
+                )
 
     def _check_gmail(self, p_log: PipelineLogger) -> None:
         interactive = sys.stdin.isatty() and sys.stdout.isatty()
@@ -163,6 +211,7 @@ class PipelineRunner:
                 continue
             # Once the limit is hit, keep researching/finding contacts but stop before writing emails.
             self._process_application(session, app, run_id, min(max_stage, 7) if limit_reached else max_stage)
+            self.usage.flush()
 
     def _discover(
         self,
@@ -175,12 +224,12 @@ class PipelineRunner:
         """Stage 0 using the explicit spec, or each standing `discovery.queries` entry, or your target profile."""
         if spec is not None:
             return run_stage_0_company_discovery(
-                session, self.config, self.llm, self.browser, run_id, spec=spec, campaign_id=campaign_id, limit=limit
+                session, self.config, self.llm_for("discovery"), self.browser, run_id, spec=spec, campaign_id=campaign_id, limit=limit
             )
         want = limit or self.config.discovery.companies_per_run
         if not self.config.discovery.queries:
             return run_stage_0_company_discovery(
-                session, self.config, self.llm, self.browser, run_id, spec=spec_from_config(self.config), limit=want
+                session, self.config, self.llm_for("discovery"), self.browser, run_id, spec=spec_from_config(self.config), limit=want
             )
         companies: list[Company] = []
         cache = DBCache(session)
@@ -192,11 +241,11 @@ class PipelineRunner:
             if isinstance(cached, dict):
                 query_spec = DiscoverySpec.from_dict(cached)
             else:
-                query_spec = parse_goal(self.llm, query, default_count=want)
+                query_spec = parse_goal(self.llm_for("campaign_parsing"), query, default_count=want)
                 cache.set(cache_key, query_spec.to_dict(), 30 * 86400)
             companies.extend(
                 run_stage_0_company_discovery(
-                    session, self.config, self.llm, self.browser, run_id, spec=query_spec, limit=want - len(companies)
+                    session, self.config, self.llm_for("discovery"), self.browser, run_id, spec=query_spec, limit=want - len(companies)
                 )
             )
         return companies
@@ -235,7 +284,7 @@ class PipelineRunner:
             else:
                 p_log.info("No interrupted applications found. Running fresh discovery...")
                 companies = self._discover(session, run_id)
-                jobs = run_stage_1_job_discovery(session, self.config, self.llm_fast, self.browser, companies, run_id)
+                jobs = run_stage_1_job_discovery(session, self.config, self.llm_for("job_extraction"), self.browser, companies, run_id)
                 active_apps = run_stage_2_filtering(session, self.config, jobs, run_id)
 
             self._process_apps(session, active_apps, run_id, max_stage, limit_drafts)
@@ -253,6 +302,7 @@ class PipelineRunner:
             raise e
         finally:
             session.close()
+            self.usage.flush()
 
         return run_id
 
@@ -324,37 +374,46 @@ class PipelineRunner:
         try:
             # Stage 3: Company Research
             if app.current_stage == 3 and max_stage >= 3:
-                if not run_stage_3_company_research(session, self.config, self.llm_fast, self.browser, app, run_id):
+                if not run_stage_3_company_research(session, self.config, self.llm_for("research"), self.browser, app, run_id):
                     return
 
             # Stage 4: Contact Research
             if app.current_stage == 4 and max_stage >= 4:
-                if not run_stage_4_contact_research(session, self.config, self.llm_fast, self.browser, app, run_id):
+                if not run_stage_4_contact_research(session, self.config, self.llm_for("contact_finding"), self.browser, app, run_id):
                     return
 
             # Stage 5: Professional Email Discovery
             if app.current_stage == 5 and max_stage >= 5:
-                if not run_stage_5_email_discovery(session, self.config, self.llm_fast, self.browser, app, run_id):
+                if not run_stage_5_email_discovery(session, self.config, self.llm_for("email_finding"), self.browser, app, run_id):
                     return
 
             # Stage 6: Opportunity Scoring
             if app.current_stage == 6 and max_stage >= 6:
-                if not run_stage_6_opportunity_scoring(session, self.config, self.llm_fast, app, run_id):
+                if not run_stage_6_opportunity_scoring(session, self.config, self.llm_for("scoring"), app, run_id):
                     return
 
             # Stage 7: Resume Tailoring
             if app.current_stage == 7 and max_stage >= 7:
-                if not run_stage_7_resume_tailoring(session, self.config, self.llm, app, run_id):
+                if not run_stage_7_resume_tailoring(session, self.config, self.llm_for("resume_tailoring"), app, run_id):
                     return
 
             # Stage 8: Email Generation
             # Stages 8-9: generate & validate; a failed validation may send the email back for one rewrite.
-            for _attempt in range(2):
+            for attempt in range(2):
                 if app.current_stage == 8 and max_stage >= 8:
-                    if not run_stage_8_email_generation(session, self.config, self.llm, app, run_id):
+                    writer = self.llm_for("email_regeneration" if attempt else "email_generation")
+                    if not run_stage_8_email_generation(
+                        session,
+                        self.config,
+                        writer,
+                        app,
+                        run_id,
+                        followup_llm=self.llm_for("followup_generation"),
+                        helper_llm=self.llm_for("summarization"),
+                    ):
                         return
                 if app.current_stage == 9 and max_stage >= 9:
-                    if not run_stage_9_validation(session, self.config, self.llm, app, run_id):
+                    if not run_stage_9_validation(session, self.config, self.llm_for("validation"), app, run_id):
                         if app.current_stage == 8:
                             continue  # rewrite requested with the validator's findings
                         return
@@ -421,7 +480,7 @@ class PipelineRunner:
                 contact_email: str | None = Field(description="Direct contact email address or null")
                 contact_name: str | None = Field(description="Deducible contact name or null")
 
-            parsed_target: TargetedParseResponse = self.llm.generate_json(prompt, TargetedParseResponse)  # type: ignore
+            parsed_target: TargetedParseResponse = self.llm_for("targeted_parsing").generate_json(prompt, TargetedParseResponse)  # type: ignore
 
             p_log.info(
                 f"Parsed target: Company='{parsed_target.company_name}', Domain='{parsed_target.domain}', "
@@ -471,7 +530,7 @@ class PipelineRunner:
                     f"Extract the Job Title, Location, Salary details, Required Experience years (float, e.g. 2.5), "
                     f"and a summary of key requirements and responsibilities."
                 )
-                parsed_jd: JDParseResponse = self.llm.generate_json(jd_prompt, JDParseResponse)  # type: ignore
+                parsed_jd: JDParseResponse = self.llm_for("targeted_parsing").generate_json(jd_prompt, JDParseResponse)  # type: ignore
 
                 jd_hash = hashlib.md5(jd.encode("utf-8")).hexdigest()[:8]
                 pasted_url = f"pasted://{company.name.lower().replace(' ', '_')}_{jd_hash}"
@@ -496,30 +555,26 @@ class PipelineRunner:
                     p_log.info("Job from pasted JD already exists in database.")
                     jobs = [existing_job]
             else:
-                jobs = run_stage_1_job_discovery(session, self.config, self.llm_fast, self.browser, [company], run_id)
+                jobs = run_stage_1_job_discovery(session, self.config, self.llm_for("job_extraction"), self.browser, [company], run_id)
 
-                # 4. If no jobs found, fallback to creating a speculative job (targeted runs always support this)
+                # 4. No matching opening: you named this company, so ask it about internships at company level
+                #    (in any mode). No job title is invented.
                 if not jobs:
-                    preferred_role = self.config.job_preferences.roles[0] if self.config.job_preferences.roles else "Software Engineer"
-                    speculative_job_title = f"{preferred_role} (Targeted Outreach)"
-                    p_log.info(f"No jobs found. Creating speculative job: '{speculative_job_title}' for {company.name}")
-
-                    spec_url = f"speculative://{company.name.lower().replace(' ', '_')}"
-                    existing_job = session.query(Job).filter(Job.url == spec_url).first()
+                    p_log.info(f"[OUTREACH] No matching public opening found for {company.name}")
+                    p_log.info("[OUTREACH] Targeted company -> creating company-level speculative outreach")
+                    target = company_outreach_target(self.config, company)
+                    existing_job = session.query(Job).filter(Job.url == target["url"]).first()
                     if not existing_job:
-                        new_job = Job(
+                        existing_job = Job(
                             company_id=company.id,
-                            title=speculative_job_title,
-                            url=spec_url,
-                            location=self.config.job_preferences.geographies[0] if self.config.job_preferences.geographies else "Remote",
-                            description="Targeted outreach software engineering application matching company's tech stack and domain.",
-                            source="speculative",
+                            title=target["title"],
+                            url=target["url"],
+                            description=target["description"],
+                            source=target["source"],
                         )
-                        session.add(new_job)
+                        session.add(existing_job)
                         session.flush()
-                        jobs = [new_job]
-                    else:
-                        jobs = [existing_job]
+                    jobs = [existing_job]
 
             # Restore exclusions
             self.config.exclusions.companies = original_exclusions
@@ -566,6 +621,7 @@ class PipelineRunner:
             raise e
         finally:
             session.close()
+            self.usage.flush()
 
         return run_id
 
@@ -581,20 +637,27 @@ class PipelineRunner:
         auto_send: bool | None = None,
         batch_size: int | None = None,
         max_stage: int = 12,
+        mode: str | None = None,
     ) -> dict[str, Any]:
-        """Creates a campaign from a natural-language goal and runs its first batch."""
+        """
+        Creates a campaign from a natural-language goal and runs its first batch. The discovery mode is fixed when the
+        campaign is created: `mode` (CLI --mode) > discovery.mode set in config.yaml > mode implied by the goal > default.
+        """
         session = self.SessionLocal()
         try:
-            spec = parse_goal(self.llm, goal, default_count=target or 25)
+            spec = parse_goal(self.llm_for("campaign_parsing"), goal, default_count=target or 25)
             if target:
                 spec.count = target
             if personas:
                 spec.personas = personas
+            spec.mode, reason = resolve_mode(self.config, spec.mode, mode)
             campaign = create_campaign(session, goal, spec, target=target, personas=personas or spec.personas, auto_send=auto_send)
             campaign_id = campaign.id
             logger.info(f"Created campaign #{campaign_id}: {goal} -> {spec.describe()} (target {campaign.target_companies})")
+            logger.info(f"[DISCOVERY] Campaign mode: {spec.mode} ({reason})")
         finally:
             session.close()
+            self.usage.flush()
         return self.continue_campaign(campaign_id, batch_size=batch_size, max_stage=max_stage)
 
     def continue_campaign(self, campaign_id: int, batch_size: int | None = None, max_stage: int = 12) -> dict[str, Any]:
@@ -625,7 +688,10 @@ class PipelineRunner:
                 companies = self._discover(session, run_id, spec=spec, campaign_id=campaign_id, limit=min(batch, remaining))
                 if not companies:
                     p_log.warning("No new companies found this run (sources may be exhausted or rate limited).")
-                jobs = run_stage_1_job_discovery(session, self.config, self.llm_fast, self.browser, companies, run_id)
+                jobs = run_stage_1_job_discovery(
+                    session, self.config, self.llm_for("job_extraction"), self.browser, companies, run_id,
+                    mode=spec.mode or None,
+                )
                 run_stage_2_filtering(session, self.config, jobs, run_id, campaign_id=campaign_id)
 
             active = (
@@ -653,6 +719,7 @@ class PipelineRunner:
             p_log.error(f"Campaign run crashed: {e}", status="CRASHED")
             raise
         finally:
+            self.usage.flush()
             self.config.contacts.personas = original_personas
             self.config.target_profile.allowed_sectors = original_allowed
             session.close()
@@ -662,14 +729,14 @@ class PipelineRunner:
         session = self.SessionLocal()
         new_run, p_log = self._new_run(session, "Company Discovery")
         try:
-            spec = parse_goal(self.llm, query, default_count=count)
+            spec = parse_goal(self.llm_for("campaign_parsing"), query, default_count=count)
             spec.count = count
             companies = self._discover(session, new_run.id, spec=spec, limit=count)
             rows = []
             for company in companies:
                 if research:
                     try:
-                        fit = research_company(session, self.config, self.llm_fast, self.browser, company, p_log)
+                        fit = research_company(session, self.config, self.llm_for("research"), self.browser, company, p_log)
                         company.status = "rejected" if fit.rejected else "target"
                         session.commit()
                     except Exception as e:
@@ -688,6 +755,7 @@ class PipelineRunner:
             return rows
         finally:
             session.close()
+            self.usage.flush()
 
     def run_outreach_cycle(self) -> dict[str, int]:
         """Sync manual sends, detect replies/bounces, send due emails and follow-ups."""
@@ -696,12 +764,13 @@ class PipelineRunner:
             if not self.gmail.authenticate(interactive=False):
                 logger.warning("Gmail not authorized; outreach cycle skipped. Run `recruiting-platform auth`.")
                 return {}
-            engine = OutreachEngine(session, self.config, self.gmail, self.llm_fast)
+            engine = OutreachEngine(session, self.config, self.gmail, self.llm_for("reply_classification"))
             summary = engine.run_cycle()
             logger.info(f"Outreach cycle: {summary}")
             return summary
         finally:
             session.close()
+            self.usage.flush()
 
     def run_daily(self, max_stage: int = 12) -> dict[str, Any]:
         """One full day of automation: outreach cycle, campaigns, standing discovery/resume, outreach cycle again."""
@@ -711,6 +780,7 @@ class PipelineRunner:
             campaign_ids = [c.id for c in session.query(Campaign).filter(Campaign.status == "active").all()]
         finally:
             session.close()
+            self.usage.flush()
         results["campaigns"] = []
         for campaign_id in campaign_ids:
             try:

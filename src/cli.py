@@ -405,7 +405,7 @@ def _print_progress(progress: dict[str, object]) -> None:
     table.add_column("Metric", style="cyan")
     table.add_column("Value", style="yellow")
     for key in (
-        "status", "target", "companies_found", "companies_qualified", "companies_rejected",
+        "status", "mode", "target", "companies_found", "companies_qualified", "companies_rejected",
         "applications", "drafts", "sent", "replies", "interviews",
     ):
         table.add_row(key.replace("_", " ").title(), str(progress.get(key)))
@@ -420,6 +420,9 @@ def start_campaign(
     auto_send: bool | None = typer.Option(None, "--auto-send/--drafts-only", help="Override outreach.auto_send"),
     batch: int | None = typer.Option(None, help="Companies to discover per run (default discovery.companies_per_run)"),
     max_stage: int = typer.Option(12, "--max-stage", help="Stop at this stage (e.g. 5 = research & emails only)"),
+    mode: str | None = typer.Option(
+        None, help="job_search | company_outreach | hybrid (default: discovery.mode, else inferred from the goal)"
+    ),
     config: str = typer.Option("config.yaml", help="Path to config.yaml"),
 ) -> None:
     """
@@ -429,7 +432,13 @@ def start_campaign(
     runner = get_runner(config)
     try:
         progress = runner.start_campaign(
-            goal, target=target, personas=_parse_list(personas), auto_send=auto_send, batch_size=batch, max_stage=max_stage
+            goal,
+            target=target,
+            personas=_parse_list(personas),
+            auto_send=auto_send,
+            batch_size=batch,
+            max_stage=max_stage,
+            mode=mode,
         )
         _print_progress(progress)
     except Exception as e:
@@ -566,8 +575,11 @@ def show_funnel(
         table.add_column("Count", justify="right")
         table.add_column("% of previous", justify="right")
         table.add_column("", style="green")
-        top = max(data["funnel"][0]["count"], 1)
+        top = max(data["funnel"][0]["count"] or 0, 1)
         for row in data["funnel"]:
+            if row["count"] is None:
+                table.add_row(row["stage"], "n/a", "-", "[dim]not tracked (needs an open-tracking pixel)[/dim]")
+                continue
             bar = "█" * max(1 if row["count"] else 0, int(30 * row["count"] / top))
             prev = f"{row['pct_of_previous']}%" if row["pct_of_previous"] is not None else "-"
             table.add_row(row["stage"], str(row["count"]), prev, bar)
@@ -579,7 +591,8 @@ def show_funnel(
             f"Bounced: {extra['bounced']}  |  Reply rate: {extra['reply_rate']}%  |  Interview rate: {extra['interview_rate']}%\n"
             f"Email verification: {stats['smtp_verified_pct']}% SMTP-verified, {stats['deliverable_likely_pct']}% "
             f"deliverable-likely (valid + catch-all) of {stats['checked']} checked; status counts {stats['counts']}; "
-            f"catch-all domains: {stats['catch_all_domains']}"
+            f"catch-all domains: {stats['catch_all_domains']}\n"
+            f"Email confidence levels: {stats['confidence_levels']}  |  Emails verified: {extra['emails_verified']}"
         )
     finally:
         session.close()
@@ -614,6 +627,80 @@ def insights(config: str = typer.Option("config.yaml", help="Path to config.yaml
             console.print(table)
         if stats.total_sent == 0:
             console.print("[yellow]No sent outreach yet — insights appear once emails are sent and tracked.[/yellow]")
+    finally:
+        session.close()
+
+
+@app.command("usage")
+def token_usage(
+    days: int = typer.Option(1, help="Days to include (1 = today, UTC)"),
+    config: str = typer.Option("config.yaml", help="Path to config.yaml"),
+) -> None:
+    """Token usage per stage/task and provider, and today's Groq budget."""
+    from src.analytics.usage import usage_summary
+    from src.config import load_config
+    from src.db.session import get_session_factory, init_db
+
+    cfg = load_config(config)
+    init_db(cfg.pipeline.db_path)
+    session = get_session_factory(cfg.pipeline.db_path)()
+    try:
+        data = usage_summary(session, days, cfg.llm.groq_daily_token_budget, cfg.llm.groq_reserved_for_emails)
+    finally:
+        session.close()
+    table = Table(title=f"Tokens used (last {days} day(s))", header_style="bold cyan")
+    for col in ("Stage / task", "Tier", "Provider", "Calls", "Prompt", "Completion", "Total", "Failures", "Avg latency"):
+        table.add_column(col, justify="right" if col not in ("Stage / task", "Tier", "Provider") else "left")
+    for r in data["by_task"]:
+        table.add_row(
+            r["task"], r["tier"], r["provider"], str(r["calls"]), f"{r['prompt_tokens']:,}",
+            f"{r['completion_tokens']:,}", f"{r['total_tokens']:,}", str(r["failures"]), f"{r['avg_latency_ms'] / 1000:.1f}s",
+        )
+    console.print(table)
+    console.print(
+        f"Groq today: {data['premium_used_today']:,} / {data['premium_budget']:,} tokens "
+        f"({data['premium_remaining_today']:,} left; {data['premium_reserved_for_emails']:,} reserved for emails)  |  "
+        f"Local today: {data['local_used_today']:,} tokens  |  Groq share: {data['premium_share_today_pct']}%"
+    )
+
+
+@app.command("explain")
+def explain_application(
+    app_id: int = typer.Argument(..., help="Application ID"),
+    config: str = typer.Option("config.yaml", help="Path to config.yaml"),
+) -> None:
+    """Explain an application's reply probability, contact choice and email evidence."""
+    from src.config import load_config
+    from src.db.models import Application as App
+    from src.db.session import get_session_factory, init_db
+
+    cfg = load_config(config)
+    init_db(cfg.pipeline.db_path)
+    session = get_session_factory(cfg.pipeline.db_path)()
+    try:
+        application = session.get(App, app_id)
+        if application is None:
+            console.print(f"[bold red]Application #{app_id} not found.[/bold red]")
+            raise typer.Exit(code=1)
+        company = application.job.company
+        contact = application.contact
+        breakdown = application.score_breakdown if isinstance(application.score_breakdown, dict) else {}
+        reply = breakdown.get("reply_probability") or {}
+        lines = [
+            f"[bold]{company.name}[/bold] ({company.sector or '?'}, {company.funding_stage or '?'}) - {application.job.title}",
+            f"State: {application.state} | outreach: {application.outreach_status or '-'} | score: {application.score}",
+            f"Company fit: {company.fit_score} - {company.fit_reasoning or ''}",
+        ]
+        if contact is not None:
+            lines += [
+                f"Contact: {contact.name} - {contact.role} [{contact.role_category}] via {contact.source} "
+                f"(confidence {contact.confidence}) {contact.source_url or ''}",
+                f"Email: {contact.email} [{contact.email_confidence_level or contact.email_status}] "
+                f"evidence: {contact.email_evidence or '-'}",
+            ]
+        lines.append("")
+        lines.append(reply.get("explanation") or f"Reply probability: {application.response_probability}")
+        console.print(Panel("\n".join(lines), title=f"Application #{app_id}"))
     finally:
         session.close()
 
@@ -769,12 +856,41 @@ def doctor(
         row("SMTP port 25 (mailbox verification)", False, f"blocked/unreachable ({e}); emails will be pattern/Hunter-verified instead")
 
     row("Typst (PDF resumes)", bool(shutil.which("typst")), shutil.which("typst") or "not installed: .typ files will be attached")
-    for name in ("hunter", "apollo", "github", "serper", "brave"):
+    optional = {
+        "hunter": "email finder/verifier skipped",
+        "apollo": "people search skipped",
+        "github": "GitHub works keyless at 60 requests/hour",
+        "serper": "using DuckDuckGo/Yahoo search",
+        "brave": "using DuckDuckGo/Yahoo search",
+    }
+    for name, fallback in optional.items():
         value = cfg.api_keys.get(name)
-        table.add_row(f"API key: {name}", "[green]set[/green]" if value else "[yellow]not set (optional)[/yellow]")
+        table.add_row(f"Provider: {name}", "[green]enabled[/green]" if value else f"[yellow]not set - {fallback}[/yellow]")
     variants = cfg.resumes or []
     existing = [v.name for v in variants if os.path.exists(v.path)]
     row("Resume variants", bool(existing) or os.path.exists(cfg.pipeline.base_resume_path), f"{existing or 'legacy base resume'}")
+    # Hybrid routing: local model health and the task -> tier table
+    from src.providers.llm.router import LLMRouter, UsageTracker
+
+    router = LLMRouter(cfg.llm, UsageTracker(None))
+    if router.local is not None:
+        ok, message = router.local.health() if hasattr(router.local, "health") else (True, "configured")
+        row("Local LLM (Ollama)", ok, message)
+    else:
+        row("Local LLM (Ollama)", False, "disabled: set llm.local_provider: ollama to cut Groq usage")
+    routing: dict[str, list[str]] = {}
+    for task, tier, model in router.describe():
+        routing.setdefault(f"{tier} ({model})", []).append(task)
+    for key, tasks in routing.items():
+        table.add_row(f"Routing -> {key}", ", ".join(tasks))
+    table.add_row("Groq daily budget", f"{cfg.llm.groq_daily_token_budget:,} tokens ({cfg.llm.groq_reserved_for_emails:,} reserved for emails)")
+
+    from src.providers.browser import BrowserProvider
+
+    pw_ok, pw_message = BrowserProvider().playwright_status()
+    row("Playwright (JS pages)", pw_ok, pw_message)
+    table.add_row("LinkedIn", "[yellow]disabled (allow_linkedin: false)[/yellow]" if not cfg.discovery.allow_linkedin else "enabled")
+
     tz = resolve_timezone(cfg.outreach.send_window.timezone)
     row("Send-window timezone", "UTC" not in str(tz) or cfg.outreach.send_window.timezone == "UTC", str(tz))
     import sys

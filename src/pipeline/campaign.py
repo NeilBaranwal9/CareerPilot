@@ -1,6 +1,7 @@
 """
 Campaigns: natural-language outreach goals such as
   "Find 200 fintech companies in India, reach engineering managers or recruiters"
+  "Find fintech startups in India and ask if they have internship opportunities for me"  (company_outreach)
 parsed into a DiscoverySpec and driven to completion across daily runs.
 """
 
@@ -10,6 +11,7 @@ from typing import Any
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from src.config import DISCOVERY_MODES, AppConfig
 from src.db.models import Application, Campaign, Company, Email
 from src.intel.classify import SECTOR_KEYWORDS, normalize_funding_stage, normalize_sector
 from src.pipeline.schemas import CampaignSpecSchema
@@ -51,7 +53,26 @@ def parse_goal(llm: BaseLLMProvider | None, goal: str, default_count: int = 25) 
         keywords=parsed.keywords,
         role_titles=parsed.role_titles,
         personas=personas,
+        mode=fallback.mode,  # inferred deterministically from the goal wording
     )
+
+
+def resolve_mode(config: AppConfig, inferred: str = "", override: str | None = None) -> tuple[str, str]:
+    """
+    Discovery mode for a campaign and why: an explicit --mode wins, then discovery.mode when config.yaml sets it,
+    then the mode implied by the goal, then the default (job_search).
+    """
+    if override:
+        mode = override.strip().lower()
+        if mode not in DISCOVERY_MODES:
+            raise ValueError(f"mode must be one of {', '.join(DISCOVERY_MODES)} (got {override!r})")
+        return mode, "set with --mode"
+    if config.discovery.mode_is_explicit():
+        note = f"; the goal suggested {inferred}" if inferred and inferred != config.discovery.mode else ""
+        return config.discovery.mode, f"discovery.mode in config.yaml{note}"
+    if inferred:
+        return inferred, "inferred from the goal"
+    return config.discovery.mode, "default"
 
 
 def create_campaign(
@@ -103,6 +124,7 @@ def campaign_progress(session: Session, campaign: Campaign) -> dict[str, Any]:
         "id": campaign.id,
         "goal": campaign.goal,
         "status": campaign.status,
+        "mode": (campaign.spec or {}).get("mode") or "config default",
         "target": campaign.target_companies,
         "companies_found": len(companies),
         "companies_qualified": sum(1 for c in companies if c.status != "rejected"),

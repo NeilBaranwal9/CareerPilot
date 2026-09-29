@@ -72,7 +72,9 @@ Rules:
   relevant item from my resume that was not in the original email, described by its outcome (not its tech stack).
 - Follow-up #2 (sent {followup_2_days} days later): 30-50 words; close the loop gracefully and ask whether someone
   else is the right person to ask about internships.
-- Never ask for a call or meeting. No buzzwords (passionate, leveraging, cutting-edge, synergy, innovative).
+- Never ask for a call or meeting. No buzzwords (passionate, leveraging, cutting-edge, synergy, innovative), no
+  "which aligns with", no "just checking in" filler, and don't repeat sentences from the original email.
+- Sound like the same student who wrote the original: plain, specific, slightly informal is fine.
 - Plain, friendly HTML using <p> tags. Sign off with my name: {user_name}. No placeholders, no subject lines.
 """
 
@@ -150,31 +152,47 @@ def find_placeholders(text: str) -> list[str]:
 
 EMAIL_STYLE_RULES = """
 
-Writing style (optimise for a reply, not for showing off technology):
-- 80-180 words in the body. Simple, professional English from a student writing to a professional. Not a cover
-  letter, not a sales email. Concrete statements over adjectives.
-- Structure, one short paragraph each:
-  1. Hi {first_name}, then one company-specific observation that explains why I am writing (a product, launch,
-     engineering or AI initiative, or business development from the context; never invent news).
-  2. One sentence about me.
-  3. One sentence connecting my experience to their company, in terms of impact/outcomes.
-  4. My interest in relevant internship opportunities.
-  5. A simple guidance or referral request, e.g. "If there's a suitable opening, I'd be grateful for a referral." or
-     "I'd appreciate any guidance on relevant opportunities."
-- Mention only the 1-2 most relevant items from my profile (e.g. Software Engineering Intern at Jio Platforms,
-  Goldman Sachs India Hackathon finalist, Team Ignition rocket telemetry software, AI/ML specialisation at VIT Chennai,
-  a relevant project). Describe them by what they achieved, not by tool lists.
-  Bad: "I built a zero-allocation Rust UDP telemetry daemon with Prometheus/Grafana observability."
-  Better: "At Jio Platforms, I worked on systems for large-scale telemetry collection and analysis."
-- Never use: passionate, leveraging, cutting-edge, synergy, revolutionary, innovative, "eager to contribute".
+How to write this email (follow silently; never mention these instructions in the email):
+- Write like a technically strong student who personally spent five minutes researching the company: natural,
+  concise, specific, professional but conversational, confident without sounding entitled. Slightly informal is fine.
+  Not a sales template, not a cover letter, no marketing language, no emojis, no "Dear Sir/Madam".
+- About {min_words}-{max_words} words. Do not add length just to add personalization.
+- Start the body with "<p>Hi {first_name},</p>". Then a flexible flow (vary it; it is not a template):
+  1. Opening: ONE specific, verifiable fact from the context (a product, an engineering or product post, a recent
+     development, the job posting, or a technology they mention). {opening_instruction}
+  2. Who I am: briefly, my degree, year and college exactly as my profile/resume state them, and that I'm looking for
+     a {target_role} internship.
+  3. The single most relevant experience or project from my resume, in plain words: what the system did and for
+     whom, with at most ONE technology name. Do not paste resume bullets or list tools.
+     Too technical: "I built a zero-allocation Rust UDP telemetry ingestion daemon with Prometheus/Grafana."
+     Plain: "At Jio Platforms I worked on the system that collects network telemetry and traces faults in real time."
+  4. At most ONE sentence linking that experience to this company or role, only if the link is natural. Never an
+     "aligns with" / "matches my" sentence, and never a second sentence about how the company fits me.
+  5. The ask: {ask_instruction}
+  (The example sentences above only show the level of detail. Write your own wording; don't reuse theirs.)
+- {persona_focus} Don't pretend to know the recipient's responsibilities beyond their title.
+- Never claim what the company needs, values, prioritises or focuses on unless the context says so explicitly. Never
+  turn a technical fact into praise. Bad: "Your innovative infrastructure aligns perfectly with my passion for scalable
+  technology." Better: "I saw your engineering post on using EKS and Spot Instances. I've worked on high-volume
+  telemetry systems at Jio, so the infrastructure side of that caught my attention."
+- Never invent projects, technologies, company initiatives, recipient responsibilities, relationships, job openings,
+  metrics or company priorities. If the context is thin, write a simpler email rather than inventing personalization.
+- Avoid stock constructions such as "which aligns with", "I am keen to", "support X's growth", "data-driven",
+  "scalable", "I was impressed by", "I would appreciate any referral or guidance". Never use: passionate, leveraging,
+  cutting-edge, synergy, innovative, revolutionary, world-class, "excited to apply". No exaggerated praise.
 - Never ask for a call or meeting, never ask when they are free, never say "please review my resume".
-- Every statement about me must be supported by my resume. Company facts must come from the context above.
-- Return a short, plain subject line and an HTML body using <p> tags only.
+{avoid_block}- Before answering, check: would this sound normal if a VIT student personally wrote it after five minutes
+  of research? If not, rewrite it simpler and more conversational.
+- Use contractions where natural (I'm, I've, I'd). Keep sentences short.
+- Subject: short and specific to this email (the product, topic or team), never "Internship Inquiry" or similar.
+- End with a short sign-off line followed by my name, {user_name}.
+- Return the subject line and an HTML body using <p> tags only.
 """
 
 BANNED_PHRASES = [
     "passionate", "leverag", "cutting-edge", "cutting edge", "synergy", "synergies", "revolutionary", "innovative",
-    "eager to contribute",
+    "eager to contribute", "i am passionate", "i'm passionate", "excited to apply", "thrilled", "dream company",
+    "game-changing", "game changer", "world-class", "delighted to",
 ]
 MEETING_ASKS = re.compile(
     r"schedule (a |an )?(quick |brief |short )?(call|meeting|chat)|when are you (free|available)|hop on a call|"
@@ -193,14 +211,16 @@ def email_body_word_count(body_html: str, user_name: str) -> int:
     return len(re.findall(r"[A-Za-z0-9][\w'’.-]*", text))
 
 
-def check_email_style(body_html: str, user_name: str, min_words: int = 80, max_words: int = 180) -> list[str]:
-    """Deterministic reply-rate style violations (empty list = OK)."""
+def check_email_style(
+    body_html: str, user_name: str, min_words: int = 120, max_words: int = 170, tolerance: int = 15
+) -> list[str]:
+    """Deterministic reply-rate style violations (empty list = OK). Length allows a small tolerance around the target."""
     issues: list[str] = []
     plain = html_to_plain(body_html)
     lowered = plain.lower()
     words = email_body_word_count(body_html, user_name)
-    if words < min_words or words > max_words:
-        issues.append(f"body is {words} words; keep it between {min_words} and {max_words}")
+    if words < min_words - tolerance or words > max_words + tolerance:
+        issues.append(f"body is {words} words; aim for about {min_words}-{max_words}")
     for phrase in BANNED_PHRASES:
         if phrase in lowered:
             issues.append(f"avoid the buzzword '{phrase}'")

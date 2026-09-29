@@ -6,8 +6,10 @@ from pydantic import BaseModel
 class BaseLLMProvider(ABC):
     """
     Abstract Base Class for LLM providers.
-    Ensures a consistent interface across OpenAI, Anthropic, Gemini, and Local AGY.
+    Ensures a consistent interface across Groq, Ollama, OpenAI, Anthropic, Gemini, and Local AGY.
     """
+
+    provider_name = "llm"
 
     def __init__(
         self,
@@ -22,6 +24,9 @@ class BaseLLMProvider(ABC):
         self.api_url = api_url
         self.temperature = temperature
         self.max_tokens = max_tokens
+        # Token usage of the most recent generate_* call: {"prompt_tokens", "completion_tokens", "model"}.
+        # Providers that cannot report usage leave it as None and the router estimates it.
+        self.last_usage: dict[str, int | str] | None = None
 
     @abstractmethod
     def generate_text(self, prompt: str, system_prompt: str | None = None) -> str:

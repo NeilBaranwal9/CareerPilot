@@ -40,7 +40,7 @@ job_preferences:
     min_employees: 100
     max_employees: 1000
   experience_years_max: 1.0
-  allow_speculative_outreach: true   # reach companies even when they have no public job posting
+  # Companies without a matching public opening: see discovery.mode below (hybrid / company_outreach).
 
 # ──────────────────────────────────────────────────────────
 # Exclusions
@@ -70,6 +70,7 @@ pipeline:
   base_resume_path: "/mnt/bridge/dev/personal/resume/resume_vineet_kushwaha.typ"   # Path to YOUR Typst base resume
   generated_resumes_dir: "/mnt/bridge/dev/personal/resume/generated"
   db_path: "data/platform.db"
+  research_cache_days: 7   # company research, contacts, jobs and email patterns are reused for 7 days
   automation: true   # If true, re-enables the scheduled task/timer if disabled; if false, disables it
 
 # ──────────────────────────────────────────────────────────
@@ -79,8 +80,8 @@ pipeline:
 # ──────────────────────────────────────────────────────────
 llm:
   provider: "groq"  # Options: groq, agy_cli, local_agy, openai, anthropic, gemini
-  model: "llama-3.3-70b-versatile"          # writing: emails, resumes, campaign parsing, company lists
-  fast_model: "llama-3.1-8b-instant"        # extraction/classification: jobs, contacts, research, scoring, replies
+  model: "openai/gpt-oss-120b"              # email writing (Groq is used ONLY for writing)
+  fast_model: "qwen/qwen3.8-27b"            # follow-ups; also the fallback when the local model is down
   fallback_models:                          # used automatically on long rate limits / decommissioned models
     - "openai/gpt-oss-120b"
     - "llama-3.1-8b-instant"
@@ -90,6 +91,21 @@ llm:
   max_tokens: 4096
   max_retries: 4
   timeout_seconds: 60
+
+  # --- Hybrid routing: local Ollama for cheap work, Groq only for writing emails ---
+  local_provider: "ollama"
+  local_model: "qwen3:8b"        # ollama pull qwen3:8b
+  local_url: "http://localhost:11434"
+  local_num_ctx: 12288          # Ollama's default context is small and silently truncates long prompts
+  local_fallback: "premium_fast" # if Ollama is down: use the Groq fast model, but only within the non-email budget
+  routing:
+    email_generation: "premium"
+    email_regeneration: "premium"
+    followup_generation: "premium_fast"
+    resume_tailoring: "premium"
+    default: "local"             # discovery, research, contacts, email finding, scoring, validation, replies
+  groq_daily_token_budget: 190000
+  groq_reserved_for_emails: 120000
 
 # ──────────────────────────────────────────────────────────
 # Gmail API Configuration
@@ -140,23 +156,37 @@ target_profile:
 # Discovery: where companies and jobs come from
 # ──────────────────────────────────────────────────────────
 discovery:
+  # What to do per company (README "Discovery Modes"):
+  #   job_search       - only real public openings that match your roles; other companies are skipped (default)
+  #   company_outreach - ask companies about current/upcoming internships; a public opening is not required
+  #                      (a real opening on the company's careers page/ATS board is still used when one matches)
+  #   hybrid           - real openings when they match, otherwise a company-level inquiry (usually the most useful)
+  # Job-search queries always come from job_preferences.roles (e.g. "product analyst data analyst"), never a
+  # hard-coded "engineer". Leave `mode` unset to let a campaign goal choose it; an explicit value always wins.
+  # mode: "job_search"
   # Standing queries re-run by `daily` / `daemon` (continuous discovery). Examples:
   #   - "Fintech companies in India"
   #   - "Series A/B AI startups"
   #   - "Trading companies"
   queries: []
-  sources: ["llm", "web_search", "yc", "linkedin_jobs", "wellfound", "ats_boards"]
-  job_sources: ["ats", "linkedin", "career_page", "wellfound", "indeed", "web_search"]
+  sources: ["yc", "web_search", "wellfound", "llm", "ats_boards"]
+  job_sources: ["ats", "career_page", "wellfound", "indeed", "web_search"]
+  allow_linkedin: false   # LinkedIn blocks automated access (HTTP 999); never searched or scraped
   companies_per_run: 20
   max_jobs_per_company: 3
   ats_boards: {}   # e.g. {greenhouse: ["razorpay"], lever: ["cred"], ashby: ["sarvam"]}
+
+# Company-level inquiries (discovery.mode company_outreach / hybrid). They never claim an opening exists.
+company_outreach:
+  ask_about_openings: true   # ask whether there are current/upcoming internship opportunities in your target areas
 
 # ──────────────────────────────────────────────────────────
 # Contacts: who to reach
 # ──────────────────────────────────────────────────────────
 contacts:
-  sources: ["linkedin_search", "team_page", "press", "github", "hunter", "apollo"]
-  personas: ["engineering_manager", "hiring_manager", "recruiter", "founder", "cto", "tech_lead"]
+  sources: ["team_page", "blog", "press", "github", "theorg", "crunchbase", "wellfound", "hunter", "apollo"]
+  personas: ["engineering_manager", "product_manager", "product_lead", "director_engineering", "head_of_engineering",
+             "staff_engineer", "recruiter", "talent_acquisition", "founder"]
   persona_strategy: "auto"        # auto = founders at small startups, EMs/recruiters at bigger companies; ordered = follow list
   max_contacts_per_company: 1     # 2 = e.g. engineering manager AND recruiter (separate threads)
   allow_generic_inbox: true       # fall back to careers@/hiring@ when no person is found
@@ -239,6 +269,8 @@ highlights:
 # Outreach: tone, sending, follow-ups, tracking
 # ──────────────────────────────────────────────────────────
 outreach:
+  min_words: 120   # target length; the checker allows +/-15 words
+  max_words: 170
   tone: "warm"                  # formal | warm | concise | enthusiastic | casual
   persona_tones:
     founder: "concise"
@@ -324,13 +356,13 @@ prompts:
     Tone: {tone}.
 
     Rules:
-    - Short, specific subject line (no clickbait).
-    - Open with one concrete, company-specific observation. If a recent launch or funding round is listed, reference it
-      (e.g. "I saw you recently launched ..."); if the contact's background is known and relevant, you may reference it.
-    - Connect at most two highlights to their product/stack with concrete results. Claim only skills from my resume.
-    - End with one clear, low-friction ask.
+    - Short, plain subject line (no clickbait).
+    - Use only facts from the context above; if it is thin, write a simpler email instead of inventing details.
+    - Mention the single most relevant experience from my resume (two at most), described by what I actually did.
+    - State plainly that I am a student looking for an internship. Never imply full-time experience.
     - Sign off with my name ({user_name}); my LinkedIn/GitHub links are appended automatically.
     - No placeholders of any kind ("[Your Name]", "<Company>", etc.).
+    (Voice, structure, persona-specific ask and anti-repetition rules are appended automatically by the platform.)
 
   # Optional: custom follow-up prompt (default is built in). Placeholders: {initial_email}, {followup_count},
   # {followup_1_days}, {followup_2_days}, plus everything available to email_generation.

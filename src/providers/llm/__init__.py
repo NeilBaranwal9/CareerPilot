@@ -5,6 +5,7 @@ from src.providers.llm.base import BaseLLMProvider
 from src.providers.llm.gemini import GeminiProvider
 from src.providers.llm.groq import GroqProvider
 from src.providers.llm.local_agy import LocalAGYProvider
+from src.providers.llm.ollama import OllamaProvider
 from src.providers.llm.openai import OpenAIProvider
 
 
@@ -27,6 +28,15 @@ def get_llm_provider(config: LLMConfig, fast: bool = False) -> BaseLLMProvider:
             fallback_models=config.fallback_models,
             max_retries=config.max_retries,
             timeout_seconds=config.timeout_seconds,
+        )
+    elif provider_name == "ollama":
+        return OllamaProvider(
+            model=model,
+            api_url=config.api_url or config.local_url,
+            temperature=config.temperature,
+            max_tokens=config.max_tokens,
+            num_ctx=config.local_num_ctx,
+            timeout_seconds=config.local_timeout_seconds,
         )
     elif provider_name == "local_agy":
         return LocalAGYProvider(
@@ -80,5 +90,6 @@ __all__ = [
     "AnthropicProvider",
     "GeminiProvider",
     "GroqProvider",
+    "OllamaProvider",
     "get_llm_provider",
 ]

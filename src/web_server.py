@@ -335,6 +335,25 @@ def get_funnel(db_path: str, campaign_id: int | None = None) -> dict[str, Any]:
         session.close()
 
 
+def get_usage(db_path: str, config_path: str, days: int = 1) -> dict[str, Any]:
+    if not os.path.exists(db_path):
+        return {"by_task": [], "per_stage": {}}
+    from src.analytics.usage import usage_summary
+    from src.db.session import get_session_factory
+
+    budget, reserve = 190_000, 120_000
+    with contextlib.suppress(Exception):
+        from src.config import load_config
+
+        cfg = load_config(config_path)
+        budget, reserve = cfg.llm.groq_daily_token_budget, cfg.llm.groq_reserved_for_emails
+    session = get_session_factory(db_path)()
+    try:
+        return usage_summary(session, days, budget, reserve)
+    finally:
+        session.close()
+
+
 def get_campaigns(db_path: str) -> list[dict[str, Any]]:
     if not os.path.exists(db_path):
         return []
@@ -835,6 +854,14 @@ class StatusWidgetRequestHandler(BaseHTTPRequestHandler):
             campaign_id = int(campaign_str) if campaign_str and campaign_str.isdigit() else None
             try:
                 self._send_json(get_funnel(self.db_path, campaign_id))
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+
+        if path == "/api/usage":
+            try:
+                days_str = query_params.get("days", ["1"])[0]
+                self._send_json(get_usage(self.db_path, self.config_path, int(days_str) if days_str.isdigit() else 1))
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
             return

@@ -124,8 +124,12 @@ def search_wellfound_companies(browser: BrowserProvider, query: str, limit: int 
     return companies
 
 
-def search_wellfound_jobs(browser: BrowserProvider, company_name: str, limit: int = 5) -> list[dict[str, Any]]:
-    results = browser.search_google(f'site:wellfound.com "{company_name}" jobs engineer', num_results=limit, include_blocked=True)
+def search_wellfound_jobs(
+    browser: BrowserProvider, company_name: str, limit: int = 5, role_terms: list[str] | None = None
+) -> list[dict[str, Any]]:
+    """Wellfound postings via search results. `role_terms` come from your configured roles (see role_search_terms)."""
+    query = f'site:wellfound.com "{company_name}" jobs {" ".join(role_terms or [])}'.strip()
+    results = browser.search_google(query, num_results=limit, include_blocked=True)
     jobs: list[dict[str, Any]] = []
     for r in results:
         url = r.get("url", "")
@@ -155,7 +159,7 @@ def search_wellfound_jobs(browser: BrowserProvider, company_name: str, limit: in
 
 def search_indeed_jobs(browser: BrowserProvider, company_name: str, role: str, limit: int = 5) -> list[dict[str, Any]]:
     """Finds Indeed postings for a company through search results ('Title - Company - City - Indeed.com')."""
-    results = browser.search_google(f'site:indeed.com "{company_name}" {role}', num_results=limit, include_blocked=True)
+    results = browser.search_google(f'site:indeed.com "{company_name}" {role}'.strip(), num_results=limit, include_blocked=True)
     jobs: list[dict[str, Any]] = []
     for r in results:
         url = r.get("url", "")

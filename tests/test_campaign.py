@@ -65,8 +65,9 @@ def test_campaign_end_to_end(tmp_path):
     assert contact.role_category == "engineering_manager" and contact.email_status == "unverified"
 
     funnel = {row["stage"]: row["count"] for row in compute_funnel(session, campaign.id)["funnel"]}
-    assert funnel["Companies Found"] == 1 and funnel["Contacts Found"] == 1
-    assert funnel["Emails Found"] == 1 and funnel["Drafts Created"] == 1 and funnel["Emails Sent"] == 0
+    assert funnel["Discovered"] == 1 and funnel["Qualified"] == 1 and funnel["Researching"] == 1
+    assert funnel["Contact Found"] == 1 and funnel["Email Found"] == 1
+    assert funnel["Draft Created"] == 1 and funnel["Sent"] == 0 and funnel["Opened"] is None
 
     # Continuing the campaign does not create duplicate outreach for the same company
     runner.continue_campaign(campaign.id)

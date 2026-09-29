@@ -157,7 +157,11 @@ def check_tailored_resume(original_text: str, resume: StructuredResumeSchema) ->
                 for skill in re.split(r"[,;/|]", values or label):
                     if skill.strip() and _norm(skill) and _norm(skill) not in source:
                         errors.append(f"skill '{skill.strip()}' not in original resume")
-    return errors
+    # Awards, rankings, hackathon wins, year of study, CGPA, any number and any technology must exist in the original.
+    from src.utils.claims import find_unsupported_claims
+
+    errors.extend(find_unsupported_claims(structured_to_text(resume), original_text, numbers="all"))
+    return list(dict.fromkeys(errors))
 
 
 # ---------------------------------------------------------------------------

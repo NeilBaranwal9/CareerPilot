@@ -20,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from src.config import AppConfig
 from src.db.models import Application, Campaign, Contact, Email, OutreachEvent
+from src.outreach.dedupe import update_ledger_status
 from src.outreach.scheduling import followup_due_at, utc_now_naive
 from src.pipeline.schemas import ReplyClassificationSchema
 from src.providers.gmail import GmailProvider
@@ -231,6 +232,7 @@ class OutreachEngine:
                 if followup.status == "pending" and idx < len(steps):
                     followup.scheduled_at = followup_due_at(email.sent_at, steps[idx].after_days, window)
                     followup.gmail_thread_id = email.gmail_thread_id
+            update_ledger_status(self.session, app.id, "sent")
             log_event(self.session, app.id, "sent", email.id, email.gmail_message_id, f"to {email.to_email}")
         else:
             app.outreach_status = "followed_up"
@@ -450,6 +452,7 @@ class OutreachEngine:
                 app.contact.do_not_contact = True
         else:
             app.outreach_status = "replied"
+        update_ledger_status(self.session, app.id, "replied")
         if self.config.outreach.stop_on_reply:
             self.cancel_followups(app, f"reply received ({category})")
         log_event(self.session, app.id, "reply", gmail_message_id=message_id, details=f"{category}: {summary}"[:500])

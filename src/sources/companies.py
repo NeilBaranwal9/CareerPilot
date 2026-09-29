@@ -68,6 +68,8 @@ class DiscoverySpec:
     personas: list[str] = field(default_factory=list)
     # Soft preference used to steer searches/prompts (hard filtering uses `sectors`).
     preferred_sectors: list[str] = field(default_factory=list)
+    # Discovery mode for a campaign (job_search | company_outreach | hybrid); "" = use discovery.mode from config.
+    mode: str = ""
 
     def describe(self) -> str:
         parts = []
@@ -88,7 +90,8 @@ class DiscoverySpec:
     def search_phrase(self) -> str:
         if self.query:
             cleaned = re.sub(r"^(find|get|list|discover|show)\s+(me\s+)?(\d+\s+)?", "", self.query.strip(), flags=re.I)
-            return cleaned
+            # "..., use actual openings when available, otherwise ask ..." describes the outreach, not the companies.
+            return _OUTREACH_CLAUSE.split(cleaned, maxsplit=1)[0].strip(" ,;.") or cleaned
         sector = " ".join((self.sectors or self.preferred_sectors)[:2]) or "tech"
         geo = self.geographies[0] if self.geographies else ""
         return f"{sector} startups {geo}".strip()
@@ -99,6 +102,7 @@ class DiscoverySpec:
             "funding_stages": self.funding_stages, "min_employees": self.min_employees,
             "max_employees": self.max_employees, "count": self.count, "keywords": self.keywords,
             "role_titles": self.role_titles, "personas": self.personas, "preferred_sectors": self.preferred_sectors,
+            "mode": self.mode,
         }
 
     @classmethod
@@ -173,6 +177,36 @@ def resolve_company_domain(browser: BrowserProvider, name: str) -> str | None:
     return None
 
 
+_OUTREACH_CLAUSE = re.compile(
+    r"[,;]?\s+(?:and\s+|then\s+)?(?:ask\b|use (?:actual|real|public) (?:job )?openings|otherwise\b)", re.IGNORECASE
+)
+_HYBRID_GOAL = re.compile(
+    r"\bhybrid\b|(?:actual|real|public) (?:job )?openings? (?:when|where|if) (?:available|possible|they exist)|"
+    r"(?:openings?|jobs?|postings?) (?:when|where|if) (?:available|possible).{0,80}\botherwise\b|"
+    r"\botherwise\b.{0,60}\bask\b.{0,60}\b(?:intern\w*|opportunit\w*|openings?)",
+    re.IGNORECASE,
+)
+_COMPANY_OUTREACH_GOAL = re.compile(
+    r"\bask (?:\w+ ){0,3}(?:if|whether|about)\b.{0,60}\b(?:intern\w*|opportunit\w*|openings?|hiring)|"
+    r"\b(?:speculative|cold) (?:outreach|inquir\w*|applications?)\b|"
+    r"\b(?:even )?(?:if|when|where) (?:they have |there (?:are|is) )?no (?:public )?(?:openings?|jobs?|postings?)",
+    re.IGNORECASE,
+)
+
+
+def infer_outreach_mode(goal: str) -> str:
+    """
+    Discovery mode implied by a goal, or "" when it doesn't say:
+    "... ask if they have internship opportunities for me" -> company_outreach;
+    "... use actual openings when available, otherwise ask companies about internships" -> hybrid.
+    """
+    if _HYBRID_GOAL.search(goal or ""):
+        return "hybrid"
+    if _COMPANY_OUTREACH_GOAL.search(goal or ""):
+        return "company_outreach"
+    return ""
+
+
 def parse_spec_fallback(goal: str, default_count: int = 25) -> DiscoverySpec:
     """Rule-based parser for goals like 'Find 200 fintech companies in India' or 'Series A/B AI startups'."""
     lowered = goal.lower()
@@ -212,6 +246,7 @@ def parse_spec_fallback(goal: str, default_count: int = 25) -> DiscoverySpec:
     size_match = re.search(r"(\d+)\s*[-–to]+\s*(\d+)\s*(?:employees|people)", lowered)
     if size_match:
         spec.min_employees, spec.max_employees = int(size_match.group(1)), int(size_match.group(2))
+    spec.mode = infer_outreach_mode(goal)
     return spec
 
 
@@ -480,6 +515,7 @@ def run_discovery(
     exclude_names: list[str],
     roles: list[str],
     ats_boards: dict[str, list[str]] | None = None,
+    allow_linkedin: bool = False,
 ) -> list[CompanyCandidate]:
     """Runs every enabled source, merges and pre-filters the candidates. Source failures are logged and skipped."""
     exclude_set = {normalize_company_name(n) for n in exclude_names}
@@ -498,7 +534,10 @@ def run_discovery(
 
     attempt("ats_boards", discover_from_ats_boards, ats_boards or {}, exclude_set)
     attempt("yc", discover_from_yc, browser, spec, exclude_set, want)
-    attempt("linkedin_jobs", discover_from_linkedin_jobs, browser, spec, roles, exclude_set, want)
+    if allow_linkedin:
+        attempt("linkedin_jobs", discover_from_linkedin_jobs, browser, spec, roles, exclude_set, want)
+    elif "linkedin_jobs" in sources:
+        logger.info("Skipping linkedin_jobs source (discovery.allow_linkedin is false).")
     attempt("wellfound", discover_from_wellfound, browser, spec, exclude_set, want)
     attempt("web_search", discover_from_web, browser, llm, spec, exclude_names, want)
     attempt("llm", discover_from_llm, llm, spec, exclude_names, min(want, 40))

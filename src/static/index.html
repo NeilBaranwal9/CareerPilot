@@ -726,6 +726,13 @@
         <div class="stat-card"><span class="stat-label">SMTP-Verified Emails</span><span id="funnel-verified" class="stat-value" style="color: var(--accent-cyan);">0%</span></div>
         <div class="stat-card"><span class="stat-label">Rejected (Poor Fit) / Bounced</span><span id="funnel-rejected" class="stat-value" style="color: var(--accent-amber);">0 / 0</span></div>
       </div>
+      <div class="section-title" style="margin-top: 18px;"><span>Tokens Used Today</span><span id="usageBudget" style="font-size: 12px; color: var(--text-muted);"></span></div>
+      <div class="table-container">
+        <table>
+          <thead><tr><th>Stage</th><th>Tier</th><th>Provider</th><th>Calls</th><th>Tokens</th><th>Failures</th></tr></thead>
+          <tbody id="usageTableBody"><tr><td colspan="6" style="text-align: center; color: var(--text-muted);">No LLM calls recorded today.</td></tr></tbody>
+        </table>
+      </div>
       <div class="section-title" style="margin-top: 18px;"><span>Campaigns</span></div>
       <div class="table-container">
         <table>
@@ -1066,14 +1073,26 @@
           fetch('/api/campaigns')
         ]);
         const funnel = await funnelRes.json();
+        try {
+          const usage = await (await fetch('/api/usage')).json();
+          const rows = usage.by_task || [];
+          document.getElementById('usageBudget').textContent = usage.premium_budget
+            ? `Groq ${usage.premium_used_today.toLocaleString()} / ${usage.premium_budget.toLocaleString()} · local ${usage.local_used_today.toLocaleString()}`
+            : '';
+          if (rows.length) {
+            document.getElementById('usageTableBody').innerHTML = rows.map(r => `
+              <tr><td>${escapeHtml(r.task)}</td><td>${escapeHtml(r.tier)}</td><td>${escapeHtml(r.provider)}</td>
+              <td>${r.calls}</td><td>${r.total_tokens.toLocaleString()}</td><td>${r.failures}</td></tr>`).join('');
+          }
+        } catch (e) { console.error('usage', e); }
         const campaigns = await campRes.json();
         const rows = funnel.funnel || [];
-        const top = Math.max(1, ...rows.map(r => r.count));
+        const top = Math.max(1, ...rows.map(r => r.count || 0));
         document.getElementById('funnelBars').innerHTML = rows.length ? rows.map(r => `
           <div class="funnel-row">
             <div class="funnel-label">${escapeHtml(r.stage)}</div>
-            <div class="funnel-track"><div class="funnel-fill" style="width: ${Math.max(r.count ? 2 : 0, 100 * r.count / top)}%;"></div></div>
-            <div class="funnel-count">${r.count}</div>
+            <div class="funnel-track"><div class="funnel-fill" style="width: ${r.count == null ? 0 : Math.max(r.count ? 2 : 0, 100 * r.count / top)}%;"></div></div>
+            <div class="funnel-count" title="${r.count == null ? 'Not tracked: needs an open-tracking pixel' : ''}">${r.count == null ? 'n/a' : r.count}</div>
             <div class="funnel-pct">${r.pct_of_previous != null ? r.pct_of_previous + '%' : ''}</div>
           </div>`).join('') : '<div style="color: var(--text-muted);">No data yet.</div>';
         const extra = funnel.extra || {};

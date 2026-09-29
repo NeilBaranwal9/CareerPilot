@@ -8,7 +8,9 @@ from src.db.models import (
     Email,
     History,
     Job,
+    LLMUsage,
     OutreachEvent,
+    OutreachLedger,
     ResumeVersion,
     Run,
 )
@@ -26,6 +28,8 @@ __all__ = [
     "ResumeVersion",
     "History",
     "OutreachEvent",
+    "OutreachLedger",
+    "LLMUsage",
     "CacheEntry",
     "init_db",
     "auto_migrate",

@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from src.db.models import Application, Company, Contact, Email, Job
@@ -45,7 +45,9 @@ def compute_funnel(session: Session, campaign_id: int | None = None) -> dict[str
     companies_with_contacts = {c.company_id for c in contacts}
     email_contacts = [c for c in contacts if c.email and (c.email_status in FOUND_EMAIL_STATUSES or c.email_status is None)]
     companies_with_email = {c.company_id for c in email_contacts}
-    companies_with_verified = {c.company_id for c in email_contacts if c.email_status == "valid"}
+    companies_with_verified = {
+        c.company_id for c in email_contacts if c.email_status == "valid" or c.email_confidence_level == "verified"
+    }
 
     app_ids = [a.id for a in apps]
     drafted_ids: set[int] = set()
@@ -61,17 +63,23 @@ def compute_funnel(session: Session, campaign_id: int | None = None) -> dict[str
     sent_ids |= {a.id for a in apps if a.sent_at or a.outreach_status in CONTACTED_STATUSES - {"bounced"}}
     replied_ids = {a.id for a in apps if a.replied_at or a.outreach_status in REPLIED_STATUSES}
     interview_ids = {a.id for a in apps if a.interview_at or a.outreach_status in ("interview", "offer")}
+    rejected_ids = {a.id for a in apps if a.outreach_status in ("not_interested", "rejected")}
     bounced = sum(1 for a in apps if a.outreach_status == "bounced")
+    not_rejected = sum(1 for c in companies if c.status != "rejected")
+    researched = sum(1 for c in companies if c.last_researched_at is not None or c.research_data)
 
-    stages = [
-        ("Companies Found", len(company_ids)),
-        ("Contacts Found", len(companies_with_contacts)),
-        ("Emails Found", len(companies_with_email)),
-        ("Emails Verified", len(companies_with_verified)),
-        ("Drafts Created", len(drafted_ids)),
-        ("Emails Sent", len(sent_ids)),
-        ("Replies", len(replied_ids)),
-        ("Interviews", len(interview_ids)),
+    stages: list[tuple[str, int | None]] = [
+        ("Discovered", len(company_ids)),
+        ("Qualified", not_rejected),
+        ("Researching", researched),
+        ("Contact Found", len(companies_with_contacts)),
+        ("Email Found", len(companies_with_email)),
+        ("Draft Created", len(drafted_ids)),
+        ("Sent", len(sent_ids)),
+        ("Opened", None),  # needs an open-tracking pixel; Gmail drafts do not report opens
+        ("Replied", len(replied_ids)),
+        ("Interview", len(interview_ids)),
+        ("Rejected", len(rejected_ids)),
     ]
     top = stages[0][1] or 1
     funnel = []
@@ -81,16 +89,19 @@ def compute_funnel(session: Session, campaign_id: int | None = None) -> dict[str
             {
                 "stage": name,
                 "count": count,
-                "pct_of_top": round(100.0 * count / top, 1),
-                "pct_of_previous": round(100.0 * count / previous, 1) if previous else None,
+                "pct_of_top": round(100.0 * count / top, 1) if count is not None else None,
+                "pct_of_previous": round(100.0 * count / previous, 1) if (previous and count is not None) else None,
             }
         )
-        previous = count or None
+        if count is not None and name != "Rejected":
+            previous = count or None
 
     return {
         "campaign_id": campaign_id,
         "funnel": funnel,
         "extra": {
+            "emails_verified": len(companies_with_verified),
+            "opened_tracking": "not tracked (requires an open-tracking pixel)",
             "qualified_companies": qualified,
             "rejected_companies": rejected,
             "total_contacts": len(contacts),
@@ -116,6 +127,13 @@ def email_verification_stats(session: Session) -> dict[str, Any]:
         "smtp_verified_pct": round(100.0 * valid / checked, 1) if checked else 0.0,
         "deliverable_likely_pct": round(100.0 * likely / checked, 1) if checked else 0.0,
         "catch_all_domains": session.query(Company).filter(Company.is_catch_all.is_(True)).count(),
+        "confidence_levels": {
+            (level or "unclassified"): n
+            for level, n in session.query(Contact.email_confidence_level, func.count(Contact.id))
+            .filter(Contact.email.isnot(None))
+            .group_by(Contact.email_confidence_level)
+            .all()
+        },
     }
 
 

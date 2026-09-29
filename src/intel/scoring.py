@@ -5,8 +5,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from src.config import AppConfig
-from src.db.models import Company, Job
-from src.intel.classify import keyword_in, parse_salary_lpa
+from src.db.models import COMPANY_OUTREACH_SOURCE, Company, Job
+from src.intel.classify import keyword_in, parse_salary_lpa, role_families, role_family
 from src.intel.learning import OutcomeStats
 
 SENIOR_TITLE_MARKERS = ["senior", "sr", "staff", "principal", "lead", "manager", "director", "head", "vp", "architect"]
@@ -133,10 +133,15 @@ def title_relevance(title: str, roles: list[str], experience_years_max: float) -
     if not lowered:
         return 0.0
     score = 0.0
+    families = role_families(roles)
     if any(r.lower() in lowered for r in roles):
         score = 1.0
-    elif any(keyword_in(lowered, m) for m in ENGINEERING_MARKERS):
-        score = 0.7
+    elif role_family(lowered) in families:
+        score = 0.7  # same family as a configured role, e.g. "Business Analyst - Intern" for "Business Analyst Intern"
+    elif (not families or "software" in families or "ai_ml" in families) and any(
+        keyword_in(lowered, m) for m in ENGINEERING_MARKERS
+    ):
+        score = 0.7  # generic engineering titles only count when you target engineering (or set no role family)
     if experience_years_max <= 2:
         if any(keyword_in(lowered, m) for m in SENIOR_TITLE_MARKERS):
             score *= 0.25
@@ -154,6 +159,8 @@ def rule_based_opportunity(job: Job, company: Company, config: AppConfig) -> dic
     """Deterministic 0..1 scores on the same six dimensions the LLM scores."""
     prefs = config.job_preferences
     role_match = title_relevance(job.title, prefs.roles, prefs.experience_years_max)
+    if job.source == COMPANY_OUTREACH_SOURCE:
+        role_match = 0.75  # company-level inquiry: no posting to match; fit comes from the company scores
 
     if job.experience_years_required is None:
         experience = 0.8

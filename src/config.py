@@ -1,7 +1,11 @@
 import os
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+# job_search = only real openings; company_outreach = company-level inquiries (openings optional);
+# hybrid = real openings when they match, otherwise a company-level inquiry. See README "Discovery Modes".
+DISCOVERY_MODES = ("job_search", "company_outreach", "hybrid")
 
 
 class SalaryRange(BaseModel):
@@ -21,6 +25,8 @@ class JobPreferences(BaseModel):
     salary_range: SalaryRange
     company_size: CompanySize
     experience_years_max: float
+    # Deprecated: no longer creates "<role> (Speculative Application)" jobs. Use discovery.mode: hybrid or
+    # company_outreach for company-level inquiries when no opening matches.
     allow_speculative_outreach: bool = False
 
 
@@ -46,6 +52,8 @@ class PipelineSettings(BaseModel):
     generated_resumes_dir: str
     db_path: str
     automation: bool = True
+    # How long company research, contacts, jobs and email-pattern discovery are cached (avoid re-querying).
+    research_cache_days: int = 7
 
     def effective_resume_mode(self) -> str:
         mode = (self.resume_mode or "").strip().lower()
@@ -76,6 +84,29 @@ class LLMConfig(BaseModel):
     fallback_models: list[str] = Field(default_factory=list)
     max_retries: int = 4
     timeout_seconds: float = 60.0
+
+    # --- Hybrid routing: local model for cheap work, premium (Groq) for writing ---
+    local_provider: str = ""  # "ollama" to enable local routing; "" = everything uses the premium provider
+    local_model: str = "qwen3:8b"
+    local_url: str = "http://localhost:11434"
+    local_num_ctx: int = 12288
+    local_max_tokens: int = 2048
+    local_timeout_seconds: float = 300.0
+    # When the local model is unavailable: "premium_fast" (use Groq fast model within budget) or "none" (fail the task)
+    local_fallback: str = "premium_fast"
+    # task -> tier (local | premium | premium_fast). "default" covers every task not listed.
+    routing: dict[str, str] = Field(
+        default_factory=lambda: {
+            "email_generation": "premium",
+            "email_regeneration": "premium",
+            "followup_generation": "premium_fast",
+            "resume_tailoring": "premium",
+            "default": "local",
+        }
+    )
+    # Daily token budget for the premium provider; local->premium fallbacks may only use (budget - reserve).
+    groq_daily_token_budget: int = 190_000
+    groq_reserved_for_emails: int = 120_000
 
     def resolved_api_key(self) -> str:
         """Returns the configured API key, falling back to the provider's standard environment variable."""
@@ -145,28 +176,57 @@ class TargetProfile(BaseModel):
 
 
 class DiscoveryConfig(BaseModel):
+    # job_search | company_outreach | hybrid (see DISCOVERY_MODES). When left out of config.yaml, a campaign goal
+    # such as "... ask if they have internship opportunities" may choose the mode; an explicit value always wins.
+    mode: str = "job_search"
     # Standing natural-language queries re-run by the daily scheduler, e.g. "Fintech companies in India".
     queries: list[str] = Field(default_factory=list)
-    # Company sources: llm, web_search, yc, linkedin_jobs, wellfound, ats_boards
-    sources: list[str] = Field(default_factory=lambda: ["llm", "web_search", "yc", "linkedin_jobs", "wellfound"])
-    # Job sources: ats, linkedin, career_page, wellfound, indeed, web_search
-    job_sources: list[str] = Field(
-        default_factory=lambda: ["ats", "linkedin", "career_page", "wellfound", "indeed", "web_search"]
-    )
+    # Company sources: llm, web_search, yc, wellfound, ats_boards (linkedin_jobs only with allow_linkedin)
+    sources: list[str] = Field(default_factory=lambda: ["yc", "web_search", "wellfound", "llm"])
+    # Job sources: ats, career_page, wellfound, indeed, web_search (linkedin only with allow_linkedin)
+    job_sources: list[str] = Field(default_factory=lambda: ["ats", "career_page", "wellfound", "indeed", "web_search"])
+    # LinkedIn blocks automated access (HTTP 999). When false, no LinkedIn search/scraping happens anywhere;
+    # LinkedIn URLs found by other sources are kept as metadata only.
+    allow_linkedin: bool = False
     companies_per_run: int = 20
     max_jobs_per_company: int = 3
     # Known ATS board tokens, e.g. {"greenhouse": ["razorpay"], "lever": ["cred"]}
     ats_boards: dict[str, list[str]] = Field(default_factory=dict)
 
+    @field_validator("mode")
+    @classmethod
+    def _valid_mode(cls, value: str) -> str:
+        mode = (value or "job_search").strip().lower()
+        if mode not in DISCOVERY_MODES:
+            raise ValueError(f"discovery.mode must be one of {', '.join(DISCOVERY_MODES)} (got {value!r})")
+        return mode
+
+    def mode_is_explicit(self) -> bool:
+        """True when config.yaml sets discovery.mode (it then takes precedence over a mode inferred from a goal)."""
+        return "mode" in self.model_fields_set
+
+
+class CompanyOutreachConfig(BaseModel):
+    """Company-level (speculative) inquiries used by discovery.mode company_outreach / hybrid."""
+
+    # Ask whether the company has current or upcoming internship opportunities (false = use the persona's usual ask).
+    ask_about_openings: bool = True
+
 
 class ContactDiscoveryConfig(BaseModel):
-    # linkedin_search, team_page, press, github, hunter, apollo
+    # team_page (team/leadership/about), blog (engineering/product), press (press + conference speakers), github,
+    # theorg, crunchbase, wellfound, hunter, apollo. (linkedin_search only with discovery.allow_linkedin)
     sources: list[str] = Field(
-        default_factory=lambda: ["linkedin_search", "team_page", "press", "github", "hunter", "apollo"]
+        default_factory=lambda: [
+            "team_page", "blog", "press", "github", "theorg", "crunchbase", "wellfound", "hunter", "apollo",
+        ]
     )
     # Preferred personas, most preferred first.
     personas: list[str] = Field(
-        default_factory=lambda: ["engineering_manager", "hiring_manager", "recruiter", "founder", "cto", "tech_lead"]
+        default_factory=lambda: [
+            "engineering_manager", "product_manager", "product_lead", "director_engineering", "head_of_engineering",
+            "staff_engineer", "recruiter", "talent_acquisition", "founder",
+        ]
     )
     # "auto" adapts to company size (founders at small startups, EMs/recruiters at larger ones); "ordered" follows personas strictly.
     persona_strategy: str = "auto"
@@ -269,6 +329,8 @@ class OutreachConfig(BaseModel):
     retry_on_bounce: bool = True
     # Days after the last follow-up with no reply before an application is marked "no_response".
     no_response_after_days: int = 10
+    min_words: int = 90
+    max_words: int = 160
 
 
 class LearningConfig(BaseModel):
@@ -289,6 +351,7 @@ class AppConfig(BaseModel):
     user_identity: UserIdentity = UserIdentity()
     target_profile: TargetProfile = Field(default_factory=TargetProfile)
     discovery: DiscoveryConfig = Field(default_factory=DiscoveryConfig)
+    company_outreach: CompanyOutreachConfig = Field(default_factory=CompanyOutreachConfig)
     contacts: ContactDiscoveryConfig = Field(default_factory=ContactDiscoveryConfig)
     email_verification: EmailVerificationConfig = Field(default_factory=EmailVerificationConfig)
     api_keys: ApiKeys = Field(default_factory=ApiKeys)
