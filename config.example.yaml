@@ -158,8 +158,9 @@ target_profile:
 discovery:
   # What to do per company (README "Discovery Modes"):
   #   job_search       - only real public openings that match your roles; other companies are skipped (default)
-  #   company_outreach - ask companies about current/upcoming internships; a public opening is not required
-  #                      (a real opening on the company's careers page/ATS board is still used when one matches)
+  #   company_outreach - company first: discover -> qualify -> contacts -> emails, then (optionally) check the
+  #                      careers page/ATS board; a matching opening is mentioned, otherwise the email asks about
+  #                      current/upcoming internships. A public opening is never required.
   #   hybrid           - real openings when they match, otherwise a company-level inquiry (usually the most useful)
   # Job-search queries always come from job_preferences.roles (e.g. "product analyst data analyst"), never a
   # hard-coded "engineer". Leave `mode` unset to let a campaign goal choose it; an explicit value always wins.
@@ -179,6 +180,7 @@ discovery:
 # Company-level inquiries (discovery.mode company_outreach / hybrid). They never claim an opening exists.
 company_outreach:
   ask_about_openings: true   # ask whether there are current/upcoming internship opportunities in your target areas
+  check_openings: true       # after contacts/emails are found, look for a matching opening (false = always inquire)
 
 # ──────────────────────────────────────────────────────────
 # Contacts: who to reach

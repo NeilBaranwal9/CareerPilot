@@ -383,6 +383,11 @@ def from_web_sources(
     if "press" in sources:
         chunks += _search_chunks(browser, f'"{name}" (founder OR CTO OR "head of engineering" OR "engineering manager" OR "head of product") interview OR announces OR said', fetch=2)
         chunks += _search_chunks(browser, f'"{name}" ("head of talent" OR "talent acquisition" OR recruiter OR "people team")', fetch=0)
+        if is_large_company(company):
+            # Large firms hire interns through campus / early-careers teams.
+            chunks += _search_chunks(
+                browser, f'"{name}" ("campus recruiting" OR "university recruiting" OR "early careers" OR "campus hiring")', fetch=0
+            )
         chunks += _search_chunks(browser, f'"{name}" speaker conference (engineering OR product OR fintech)', fetch=1)
     if "theorg" in sources:
         for r in browser.search_google(f'site:theorg.com "{name}"', num_results=8, include_blocked=True):
@@ -481,18 +486,27 @@ FAMILY_PERSONAS: dict[str, list[str]] = {
     "ai_ml": ["data_lead", "engineering_manager", "vp_engineering", "recruiter"],
 }
 EARLY_STAGE_HEADCOUNT = 50
+# Above this size internships usually run through campus / early-careers recruiting.
+LARGE_COMPANY_HEADCOUNT = 1000
+
+
+def is_large_company(company: Company) -> bool:
+    headcount = effective_headcount(company.employee_count, company.funding_stage)
+    return headcount is not None and headcount > LARGE_COMPANY_HEADCOUNT
 
 
 def personas_for_families(families: list[str], company: Company) -> list[str]:
     """
     Recipient preference for a company-level inquiry, derived from your target role families (in your order):
     product/data -> product lead / PM / data lead / recruiter, engineering -> EM / head of engineering / recruiter,
-    QA -> QA lead / EM / recruiter; founders first at early-stage startups.
+    QA -> QA lead / EM / recruiter; founders first at early-stage startups, recruiters first at large companies.
     """
     preferred: list[str] = []
     headcount = effective_headcount(company.employee_count, company.funding_stage)
     if (headcount is not None and headcount <= EARLY_STAGE_HEADCOUNT) or company.funding_stage in ("pre_seed", "seed"):
         preferred.append("founder")
+    elif is_large_company(company):
+        preferred.append("recruiter")
     for family in families:
         for persona in FAMILY_PERSONAS.get(family, []):
             if persona not in preferred:

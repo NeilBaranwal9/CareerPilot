@@ -211,6 +211,9 @@ class CompanyOutreachConfig(BaseModel):
 
     # Ask whether the company has current or upcoming internship opportunities (false = use the persona's usual ask).
     ask_about_openings: bool = True
+    # company_outreach: after contacts and emails are found, look for a matching opening on the company's careers
+    # page / ATS board; if one exists the email refers to it. false = always send the company-level inquiry.
+    check_openings: bool = True
 
 
 class ContactDiscoveryConfig(BaseModel):

@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from src.config import AppConfig, load_config
 from src.db.models import Application, Campaign, Company, Contact, Email, History, Job, Run
 from src.db.session import get_session_factory, init_db
+from src.intel.classify import expand_sectors
 from src.outreach.dedupe import backfill_ledger
 from src.outreach.engine import OutreachEngine
 from src.pipeline.campaign import (
@@ -25,6 +26,7 @@ from src.pipeline.stages import (
     TERMINAL_STATES,
     company_outreach_target,
     research_company,
+    run_opening_check,
     run_stage_0_company_discovery,
     run_stage_1_job_discovery,
     run_stage_2_filtering,
@@ -387,8 +389,10 @@ class PipelineRunner:
                 if not run_stage_5_email_discovery(session, self.config, self.llm_for("email_finding"), self.browser, app, run_id):
                     return
 
-            # Stage 6: Opportunity Scoring
+            # Stage 6: Opportunity Scoring. A company-level inquiry first checks for a matching opening, now that the
+            # company is qualified and a contact with an email exists (job discovery is enrichment, not the entry point).
             if app.current_stage == 6 and max_stage >= 6:
+                run_opening_check(session, self.config, self.llm_for("job_extraction"), self.browser, app, run_id)
                 if not run_stage_6_opportunity_scoring(session, self.config, self.llm_for("scoring"), app, run_id):
                     return
 
@@ -678,8 +682,9 @@ class PipelineRunner:
 
             spec = campaign_spec(campaign)
             if spec.sectors:
-                # A campaign for e.g. fintech rejects any company whose researched sector is not fintech.
-                self.config.target_profile.allowed_sectors = list(spec.sectors)
+                # A campaign for e.g. fintech rejects companies outside that sector family
+                # (fintech also covers insurtech and trading/brokerage).
+                self.config.target_profile.allowed_sectors = expand_sectors(spec.sectors)
             qualified = qualified_company_count(session, campaign_id)
             remaining = campaign.target_companies - qualified
             batch = batch_size or self.config.discovery.companies_per_run

@@ -20,7 +20,14 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from src.intel.classify import FUNDING_ORDER, SECTOR_KEYWORDS, classify_sector, keyword_in, normalize_sector
+from src.intel.classify import (
+    FUNDING_ORDER,
+    SECTOR_KEYWORDS,
+    classify_sector,
+    expand_sectors,
+    keyword_in,
+    normalize_sector,
+)
 from src.pipeline.schemas import CompanyListResponse
 from src.providers.browser import BrowserProvider
 from src.providers.llm import BaseLLMProvider
@@ -285,9 +292,10 @@ def matches_spec(cand: CompanyCandidate, spec: DiscoverySpec) -> bool:
     """Cheap pre-filter before full research (research + fit scoring does the thorough check)."""
     text = " ".join(x for x in (cand.name, cand.industry, cand.sector, cand.description) if x)
     if spec.sectors:
+        wanted = expand_sectors(spec.sectors)
         sector = normalize_sector(cand.sector) or normalize_sector(cand.industry)
         _primary, all_sectors = classify_sector(text)
-        if sector not in spec.sectors and not set(all_sectors) & set(spec.sectors):
+        if sector not in wanted and not set(all_sectors) & set(wanted):
             # Unknown sector: keep it for research rather than discarding on missing data.
             if sector or all_sectors:
                 return False
@@ -306,13 +314,31 @@ def matches_spec(cand: CompanyCandidate, spec: DiscoverySpec) -> bool:
 # ---------------------------------------------------------------------------
 
 
+# What a sector covers when it is the goal, e.g. "Find 200 fintech companies in India".
+SECTOR_SCOPE: dict[str, str] = {
+    "fintech": "payments, lending, neobanks, wealth and investing, insurtech, trading/brokerage and market "
+    "infrastructure, and established banks and financial-services firms with technology teams",
+}
+
+
+def _scope_hint(spec: DiscoverySpec) -> str:
+    scopes = [SECTOR_SCOPE[s] for s in spec.sectors if s in SECTOR_SCOPE]
+    mix = (
+        "Include a mix of startups and established companies (large, listed or bank-owned firms with technology teams) "
+        "unless the request limits the stage or size.\n"
+    )
+    return mix + (f"Cover the whole space: {'; '.join(scopes)}.\n" if scopes else "")
+
+
 def discover_from_llm(
     llm: BaseLLMProvider, spec: DiscoverySpec, exclude: list[str], count: int
 ) -> list[CompanyCandidate]:
     prompt = (
         f"List {count} real, currently operating companies matching this request: '{spec.search_phrase()}'.\n"
         f"Constraints: {spec.describe()}.\n"
-        f"They must employ software engineers. Prefer companies likely to be hiring junior engineers.\n"
+        f"{_scope_hint(spec)}"
+        f"They must have technology, product or data teams that could take interns. Company discovery does not "
+        f"depend on job openings: include companies whether or not they currently advertise roles.\n"
         f"DO NOT include any of these companies: {exclude[:150]}.\n"
         "For each company give its official website domain (not a LinkedIn/Crunchbase URL), approximate employee "
         "count, industry, canonical sector (fintech, trading, ai, healthtech, edtech, saas, ...), latest funding stage "
@@ -341,7 +367,9 @@ def discover_from_web(
 ) -> list[CompanyCandidate]:
     year = datetime.now(UTC).year
     phrase = spec.search_phrase()
-    queries = [f"top {phrase} list {year}", f"{phrase} funded startups {year}", f"best {phrase} to work for"]
+    # Startup lists and established firms: a company does not need a job posting to be worth contacting.
+    queries = [f"top {phrase} list {year}", f"largest {phrase} {year}", f"{phrase} funded startups {year}",
+               f"best {phrase} to work for"]
     text = ""
     seen_urls: set[str] = set()
     for query in queries:
@@ -412,7 +440,7 @@ def discover_from_yc(browser: BrowserProvider, spec: DiscoverySpec, exclude: set
             if x
         )
         primary, all_sectors = classify_sector(text)
-        if spec.sectors and not set(all_sectors) & set(spec.sectors):
+        if spec.sectors and not set(all_sectors) & set(expand_sectors(spec.sectors)):
             continue
         locations = " ".join(str(x) for x in (c.get("all_locations"), " ".join(c.get("regions") or [])) if x).lower()
         if geos and not any(g in locations for g in geos):

@@ -8,19 +8,20 @@ from sqlalchemy.orm import sessionmaker
 
 from src.config import load_config
 from src.db.models import Application, Base, Company, Contact, Email, History, Job, ResumeVersion, Run
-from src.intel.classify import describe_role_families, role_families, role_search_terms
+from src.intel.classify import classify_role, describe_role_families, expand_sectors, role_families, role_search_terms
 from src.intel.scoring import title_relevance
 from src.outreach.voice import check_company_inquiry, check_grounding
 from src.pipeline.campaign import parse_goal, resolve_mode
 from src.pipeline.schemas import EmailGenResponse, JobListResponse, ValidationResponse
 from src.pipeline.stages import (
+    run_opening_check,
     run_stage_1_job_discovery,
     run_stage_2_filtering,
     run_stage_8_email_generation,
     run_stage_9_validation,
 )
-from src.sources.companies import DiscoverySpec, infer_outreach_mode
-from src.sources.contacts import ContactCandidate, personas_for_families, rank_contacts
+from src.sources.companies import CompanyCandidate, DiscoverySpec, infer_outreach_mode, matches_spec
+from src.sources.contacts import ContactCandidate, from_web_sources, personas_for_families, rank_contacts
 from src.sources.job_boards import search_wellfound_jobs
 
 PRODUCT_DATA_ROLES = ["Product Analyst Intern", "Associate Product Manager Intern", "Data Analyst Intern",
@@ -39,12 +40,14 @@ class FakeBrowser:
 
     def __init__(self) -> None:
         self.queries: list[str] = []
+        self.fetched: list[str] = []
 
     def search_google(self, query, num_results=5, include_blocked=False):
         self.queries.append(query)
         return []
 
     def fetch_page(self, url, use_playwright=False):
+        self.fetched.append(url)
         return "<html><body>Careers</body></html>"
 
     def extract_text(self, html):
@@ -177,12 +180,56 @@ def test_company_outreach_needs_no_public_opening(caplog):
     assert apps[0].state == "Company Research"
 
 
-def test_company_outreach_still_uses_a_real_opening_from_the_careers_page():
-    session = _db()
+def test_company_outreach_checks_openings_only_after_contacts_are_found():
+    session, browser = _db(), FakeBrowser()
     session.add(Run(id="R"))
-    jobs = run_stage_1_job_discovery(session, _config(mode="company_outreach"), JobsLLM(), FakeBrowser(),
-                                     _companies(session, "OpenCo"), "R")
-    assert [(j.title, j.source) for j in jobs] == [("Product Analyst Intern", "career_page")]
+    cfg = _config(mode="company_outreach")
+    jobs = run_stage_1_job_discovery(session, cfg, JobsLLM(), browser, _companies(session, "OpenCo", "QuietCo"), "R")
+    # company discovery is independent of jobs: nothing is searched or fetched up front
+    assert browser.queries == [] and browser.fetched == []
+    assert {j.source for j in jobs} == {"company_outreach"}
+    apps = {a.job.company.name: a for a in run_stage_2_filtering(session, cfg, jobs, "R")}
+    # a second thread at OpenCo (max_contacts_per_company: 2) shares the same company-level target
+    sibling = Application(run_id="R", job_id=apps["OpenCo"].job_id, current_stage=6, state="Opportunity Scoring",
+                          outreach_type="company_speculative")
+    session.add(sibling)
+    session.commit()
+
+    assert run_opening_check(session, cfg, JobsLLM(), browser, apps["OpenCo"], "R") is True
+    for app in (apps["OpenCo"], sibling):
+        assert app.outreach_type == "job" and not app.is_company_level
+        assert (app.job.title, app.job.source) == ("Product Analyst Intern", "career_page")
+    assert browser.queries == []  # only the careers page / ATS board, no job-board searches
+
+    assert run_opening_check(session, cfg, JobsLLM(), browser, apps["QuietCo"], "R") is False
+    assert apps["QuietCo"].is_company_level and apps["QuietCo"].job.title == "Company-level internship inquiry"
+    note = session.query(History).filter(History.application_id == apps["QuietCo"].id, History.state == "Opening Check").one()
+    assert "company-level internship inquiry" in note.notes
+
+
+def test_opening_check_can_be_turned_off():
+    session, browser = _db(), FakeBrowser()
+    session.add(Run(id="R"))
+    cfg = _config(mode="company_outreach")
+    cfg.company_outreach.check_openings = False
+    jobs = run_stage_1_job_discovery(session, cfg, JobsLLM(), browser, _companies(session, "OpenCo"), "R")
+    app = run_stage_2_filtering(session, cfg, jobs, "R")[0]
+    assert run_opening_check(session, cfg, JobsLLM(), browser, app, "R") is False
+    assert app.is_company_level and browser.fetched == []
+
+
+def test_company_outreach_pipeline_contacts_first_then_uses_a_real_opening(tmp_path):
+    from tests.test_campaign import make_runner
+
+    runner, session = make_runner(tmp_path, discovery__mode="company_outreach")
+    runner.run()
+    app = session.query(Application).one()
+    # the mock careers page lists "Software Engineer", which matches the example roles
+    assert app.state == "Completed" and app.outreach_type == "job" and app.job.title == "Software Engineer"
+    history = session.query(History).filter(History.application_id == app.id).order_by(History.id).all()
+    states = [h.state for h in history]
+    assert states.index("Professional Email Discovery") < states.index("Opening Check")
+    assert app.contact.email and session.query(Email).filter(Email.application_id == app.id).count() >= 1
 
 
 def test_hybrid_prefers_real_openings_and_falls_back_to_company_level(caplog):
@@ -224,6 +271,8 @@ def test_company_level_recipients_follow_target_role_families():
     assert personas_for_families(["software"], mid)[:3] == ["engineering_manager", "vp_engineering", "hiring_manager"]
     assert personas_for_families(["qa"], mid)[:3] == ["qa_lead", "engineering_manager", "recruiter"]
     assert personas_for_families(["product"], Company(name="Tiny", employee_count=12))[0] == "founder"
+    big_bank = Company(name="BigBank", employee_count=50000)
+    assert personas_for_families(["software", "data"], big_bank)[:3] == ["recruiter", "engineering_manager", "vp_engineering"]
     assert personas_for_families([], mid) == ["hiring_manager", "recruiter"]
 
 
@@ -244,6 +293,46 @@ def test_rank_contacts_prefers_role_family_personas_only_when_asked():
     assert rank_contacts(candidates(), company, cfg, preferred_personas=preferred)[0].name == "Pat Lead"
     cfg.contacts.persona_strategy = "ordered"  # an explicit order is respected as-is
     assert rank_contacts(candidates(), company, cfg, preferred_personas=preferred)[0].name == "Eve Manager"
+
+
+def test_large_companies_are_searched_for_campus_recruiters():
+    for size, expected in ((50000, True), (200, False)):
+        browser = FakeBrowser()
+        from_web_sources(browser, None, Company(name="BigBank", employee_count=size), ["press"])
+        assert any("campus recruiting" in q for q in browser.queries) is expected
+    assert classify_role("Head of Early Careers")[0] == "recruiter"
+
+
+# ---------------------------------------------------------------------------
+# Company discovery (independent of jobs)
+# ---------------------------------------------------------------------------
+
+
+def test_fintech_goal_covers_the_whole_financial_space():
+    assert expand_sectors(["fintech"]) == ["fintech", "insurtech", "trading"]
+    assert expand_sectors(["ai", "fintech"]) == ["ai", "fintech", "insurtech", "trading"]
+    spec = DiscoverySpec(query="Find 200 fintech companies in India", sectors=["fintech"], geographies=["India"])
+    assert matches_spec(CompanyCandidate(name="Acko", sector="insurtech", description="Digital insurance"), spec)
+    assert matches_spec(CompanyCandidate(name="Zerodha", sector="trading", description="Stock broking"), spec)
+    assert not matches_spec(CompanyCandidate(name="Practo", sector="healthtech", description="Doctor booking"), spec)
+
+
+def test_llm_company_discovery_asks_for_startups_and_established_firms_regardless_of_openings():
+    from src.pipeline.schemas import CompanyListResponse
+    from src.sources.companies import discover_from_llm
+
+    prompts: list[str] = []
+
+    class ListLLM:
+        def generate_json(self, prompt, schema, system_prompt=None):
+            prompts.append(prompt)
+            return CompanyListResponse(companies=[])
+
+    spec = DiscoverySpec(query="Find 200 fintech companies in India", sectors=["fintech"], geographies=["India"])
+    discover_from_llm(ListLLM(), spec, [], 40)
+    assert "startups and established companies" in prompts[0] and "established banks" in prompts[0]
+    assert "whether or not they currently advertise roles" in prompts[0]
+    assert "junior engineers" not in prompts[0]
 
 
 # ---------------------------------------------------------------------------

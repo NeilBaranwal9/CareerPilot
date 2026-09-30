@@ -15,6 +15,7 @@ from src.db.models import (
     COMPANY_OUTREACH_SOURCE,
     COMPANY_OUTREACH_TITLE,
     NON_OPENING_SOURCES,
+    OUTREACH_JOB,
     Application,
     Company,
     Contact,
@@ -478,6 +479,67 @@ def outreach_role_label(config: AppConfig, app: Application) -> str:
     return f"internship opportunities in {areas}" if areas else "internship opportunities"
 
 
+def _company_jobs(
+    session: Session,
+    config: AppConfig,
+    llm: BaseLLMProvider,
+    browser: BrowserProvider,
+    company: Company,
+    p_log: PipelineLogger,
+    careers_only: bool = False,
+) -> list[dict[str, Any]]:
+    """
+    Real openings at one company that match your roles (cached for `research_cache_days`). `careers_only` reads only
+    the company's own careers page / ATS board; a cached full search is reused when one exists.
+    """
+    cache = DBCache(session)
+    # v3: role-aware queries/matching (v2 results were searched with a hard-coded "engineer" query)
+    full_key = f"job_discovery_v3_{company.name.lower()}"
+    careers_key = f"job_discovery_v3_careers_{company.name.lower()}"
+    jobs_data: list[dict[str, Any]] | None = None
+    for key in [full_key, careers_key] if careers_only else [full_key]:
+        cached = cache.get(key)
+        if cached is not None:
+            p_log.info(f"Found cached job listings for {company.name}")
+            jobs_data = list(cached)
+            break
+    if jobs_data is None:
+        sources = list(config.discovery.job_sources)
+        if careers_only:
+            sources = [s for s in sources if s in ("ats", "career_page")]
+        jobs_data = _discover_jobs_for_company(config, llm, browser, company, p_log, sources=sources)
+        cache.set(careers_key if careers_only else full_key, jobs_data, config.pipeline.research_cache_days * 86400)
+
+    real_jobs = [j for j in jobs_data if j.get("source") not in NON_OPENING_SOURCES]
+    if real_jobs:
+        company.hiring_status = "hiring"
+        company.open_roles_count = max(company.open_roles_count or 0, len(real_jobs))
+    elif company.hiring_status != "hiring":
+        company.hiring_status = "no_public_openings"
+    return real_jobs
+
+
+def _upsert_job(session: Session, company: Company, j_data: dict[str, Any]) -> Job:
+    url = (j_data.get("url") or "").strip() or None  # empty/whitespace-only URL becomes None
+    existing = session.query(Job).filter(Job.url == url).first() if url else None
+    if existing is not None:
+        return existing
+    job = Job(
+        company_id=company.id,
+        title=j_data["title"],
+        url=url,
+        location=j_data.get("location"),
+        salary=j_data.get("salary"),
+        experience_years_required=j_data.get("experience_years"),
+        description=j_data.get("description"),
+        source=j_data.get("source"),
+        posted_at=j_data.get("posted_at"),
+    )
+    session.add(job)
+    session.flush()  # Populate job.id and make it queryable within the transaction
+    return job
+
+
 def run_stage_1_job_discovery(
     session: Session,
     config: AppConfig,
@@ -488,28 +550,28 @@ def run_stage_1_job_discovery(
     mode: str | None = None,
 ) -> list[Job]:
     """
-    Stage 1: Job Discovery
-    Finds open roles at each company from ATS boards (Greenhouse/Lever/Ashby/Workable/SmartRecruiters), LinkedIn,
-    the careers page, Wellfound, Indeed and web search, depending on `mode` (default `discovery.mode`):
-    - job_search: only real openings that match your roles; companies without one are skipped.
-    - company_outreach: checks the company's own careers page/ATS board; without a matching opening the company
-      gets a company-level inquiry (no public opening required).
+    Stage 1: Job Discovery (the outreach target for each company), depending on `mode` (default `discovery.mode`):
+    - job_search: real openings that match your roles (ATS boards, careers page, Wellfound, Indeed, web search,
+      LinkedIn only if allowed); companies without one are skipped.
+    - company_outreach: no job search here. Every company gets a company-level inquiry; the matching-opening check
+      runs later (run_opening_check), after the company is qualified and a contact with an email is found.
     - hybrid: full job search; companies without a matching opening fall back to a company-level inquiry.
     A job title is never invented: a company-level inquiry is labelled as such and never names a role.
     """
     p_log = PipelineLogger(logger, run_id, "Stage 1: Job Discovery")
     mode = mode or config.discovery.mode
     p_log.info(f"[DISCOVERY] Mode: {mode}")
-    sources = list(config.discovery.job_sources)
     if mode == "company_outreach":
         p_log.info("[DISCOVERY] Company-level outreach enabled; public job opening not required.")
-        sources = [s for s in sources if s in ("ats", "career_page")]
-        p_log.info("[DISCOVERY] Checking each company's careers page / ATS board for a matching opening...")
+        p_log.info(
+            "[DISCOVERY] Openings are checked after contacts and emails are found"
+            if config.company_outreach.check_openings
+            else "[DISCOVERY] Opening check disabled (company_outreach.check_openings: false)"
+        )
     else:
         p_log.info("[DISCOVERY] Searching for actual openings...")
         if mode == "hybrid":
             p_log.info("[DISCOVERY] Hybrid: companies without a matching opening get a company-level inquiry.")
-    if any(s in sources for s in ("wellfound", "indeed", "web_search", "linkedin")):
         terms = role_search_terms(config.job_preferences.roles)
         p_log.info(f"[DISCOVERY] Job-search terms from your target roles: {', '.join(terms) or '(none: generic search)'}")
     if mode == "job_search" and config.job_preferences.allow_speculative_outreach:
@@ -517,76 +579,88 @@ def run_stage_1_job_discovery(
             "[DISCOVERY] job_preferences.allow_speculative_outreach is deprecated and no longer creates speculative "
             "jobs. Set discovery.mode: hybrid (or company_outreach) to contact companies without a matching opening."
         )
-    p_log.info(f"Searching jobs for {len(companies)} companies...")
+    p_log.info(f"Preparing outreach targets for {len(companies)} companies...")
 
     all_jobs = []
     seen_urls = set()
     for company in companies:
         p_log.company = company.name
-
-        cache = DBCache(session)
-        # v3: role-aware queries/matching (v2 results were searched with a hard-coded "engineer" query)
-        scope = "careers_" if mode == "company_outreach" else ""
-        cache_key = f"job_discovery_v3_{scope}{company.name.lower()}"
-        cached_jobs = cache.get(cache_key)
-
-        jobs_data: list[dict[str, Any]] = []
-        if cached_jobs is not None:
-            p_log.info(f"Found cached job listings for {company.name}")
-            jobs_data = list(cached_jobs)
+        if mode == "company_outreach":
+            p_log.info("[OUTREACH] Creating company-level speculative outreach")
+            jobs_data = [company_outreach_target(config, company)]
         else:
-            jobs_data = _discover_jobs_for_company(config, llm, browser, company, p_log, sources=sources)
-            cache.set(cache_key, jobs_data, config.pipeline.research_cache_days * 86400)
-
-        real_jobs = [j for j in jobs_data if j.get("source") not in NON_OPENING_SOURCES]
-        jobs_data = real_jobs
-        if real_jobs:
-            company.hiring_status = "hiring"
-            company.open_roles_count = max(company.open_roles_count or 0, len(real_jobs))
-            p_log.info(f"[OUTREACH] Matching opening found -> job-specific outreach ({real_jobs[0].get('title')})")
-        else:
-            if company.hiring_status != "hiring":
-                company.hiring_status = "no_public_openings"
-            p_log.info(f"[OUTREACH] No matching public opening found for {company.name}")
-            if mode == "job_search":
-                p_log.info("[OUTREACH] job_search mode -> skipping company (no speculative job is created)")
+            jobs_data = _company_jobs(session, config, llm, browser, company, p_log)
+            if jobs_data:
+                p_log.info(f"[OUTREACH] Matching opening found -> job-specific outreach ({jobs_data[0].get('title')})")
             else:
-                if mode == "hybrid":
+                p_log.info(f"[OUTREACH] No matching public opening found for {company.name}")
+                if mode == "job_search":
+                    p_log.info("[OUTREACH] job_search mode -> skipping company (no speculative job is created)")
+                else:
                     p_log.info("[OUTREACH] Hybrid mode -> falling back to company-level outreach")
-                p_log.info("[OUTREACH] Creating company-level speculative outreach")
-                jobs_data = [company_outreach_target(config, company)]
+                    p_log.info("[OUTREACH] Creating company-level speculative outreach")
+                    jobs_data = [company_outreach_target(config, company)]
 
         for j_data in jobs_data:
-            # Normalize URL: empty/whitespace-only becomes None
             url = (j_data.get("url") or "").strip() or None
             if url:
                 if url in seen_urls:
                     continue
                 seen_urls.add(url)
-
-            existing_job = session.query(Job).filter(Job.url == url).first() if url else None
-            if not existing_job:
-                new_job = Job(
-                    company_id=company.id,
-                    title=j_data["title"],
-                    url=url,
-                    location=j_data.get("location"),
-                    salary=j_data.get("salary"),
-                    experience_years_required=j_data.get("experience_years"),
-                    description=j_data.get("description"),
-                    source=j_data.get("source"),
-                    posted_at=j_data.get("posted_at"),
-                )
-                session.add(new_job)
-                session.flush()  # Populate job.id and make it queryable within the transaction
-                all_jobs.append(new_job)
-            else:
-                all_jobs.append(existing_job)
+            all_jobs.append(_upsert_job(session, company, j_data))
 
     session.commit()
     p_log.company = None
-    p_log.info(f"Discovered {len(all_jobs)} jobs across companies.", status="SUCCESS")
+    p_log.info(f"Prepared {len(all_jobs)} outreach targets across companies.", status="SUCCESS")
     return all_jobs
+
+
+def run_opening_check(
+    session: Session,
+    config: AppConfig,
+    llm: BaseLLMProvider,
+    browser: BrowserProvider,
+    app: Application,
+    run_id: str,
+) -> bool:
+    """
+    Opening check for a company-level inquiry, run once the company is qualified and a contact with an email exists:
+    looks for a matching opening on the company's own careers page / ATS board. Found -> this thread (and its sibling
+    threads at the company) becomes job-specific and the email refers to that real opening; not found -> it stays a
+    company-level inquiry. Returns True when the application switched to a real opening.
+    """
+    if not app.is_company_level or not config.company_outreach.check_openings:
+        return False
+    company = app.job.company
+    p_log = PipelineLogger(logger, run_id, "Opening Check", company.name)
+    p_log.info("[OUTREACH] Checking the careers page / ATS board for a matching opening...")
+    try:
+        real_jobs = _company_jobs(session, config, llm, browser, company, p_log, careers_only=True)
+    except Exception as e:
+        p_log.warning(f"Opening check failed ({e}); keeping the company-level inquiry.")
+        return False
+
+    placeholder = app.job
+    threads = session.query(Application).filter(Application.job_id == placeholder.id).all()
+    job = _upsert_job(session, company, real_jobs[0]) if real_jobs else None
+    if job is not None and session.query(Application).filter(Application.job_id == job.id).first() is not None:
+        job = None  # that opening already has its own thread; keep this one company-level
+    if job is None:
+        p_log.info(f"[OUTREACH] No matching public opening found for {company.name}")
+        p_log.info("[OUTREACH] Keeping the company-level internship inquiry")
+        session.add(History(application_id=app.id, stage=6, state="Opening Check", run_id=run_id,
+                            notes="No matching public opening; sending a company-level internship inquiry."))
+        session.commit()
+        return False
+
+    for thread in threads:
+        thread.job = job
+        thread.outreach_type = OUTREACH_JOB
+        session.add(History(application_id=thread.id, stage=6, state="Opening Check", run_id=run_id,
+                            notes=f"Matching opening found: {job.title} ({job.url}). Switched to job-specific outreach."))
+    session.commit()
+    p_log.info(f"[OUTREACH] Matching opening found -> job-specific outreach ({job.title})")
+    return True
 
 
 def run_stage_2_filtering(
@@ -1126,6 +1200,7 @@ def run_stage_4_contact_research(
                     state="Professional Email Discovery",
                     campaign_id=app.campaign_id,
                     persona=extra_contact.role_category,
+                    outreach_type=app.outreach_type,
                 )
             )
     session.commit()

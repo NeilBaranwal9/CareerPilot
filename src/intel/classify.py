@@ -123,6 +123,23 @@ def classify_sector(text: str) -> tuple[str, list[str]]:
     return ranked[0][0], [s for s, _ in ranked]
 
 
+# A sector named in a goal also covers its close relatives: "fintech" means the whole financial space
+# (payments, lending, banks, wealth, insurance, trading/brokerage), not only companies tagged "fintech".
+SECTOR_FAMILIES: dict[str, list[str]] = {
+    "fintech": ["fintech", "insurtech", "trading"],
+}
+
+
+def expand_sectors(sectors: list[str]) -> list[str]:
+    """['fintech'] -> ['fintech', 'insurtech', 'trading']; other sectors are returned unchanged."""
+    out: list[str] = []
+    for sector in sectors:
+        for s in SECTOR_FAMILIES.get(sector, [sector]):
+            if s not in out:
+                out.append(s)
+    return out
+
+
 def normalize_sector(label: str | None) -> str | None:
     """Maps free-text industry labels ('FinTech', 'Financial Services', 'AI/ML') to canonical sector keys."""
     if not label:
@@ -175,6 +192,7 @@ _ROLE_RULES: list[tuple[str, list[str]]] = [
         "people partner", "hr business partner", "human resources", "hr manager", "hr executive", "head of people",
         "ta", "ta manager", "ta lead", "ta partner", "talent", "campus recruiter",
         "people operations", "talent lead", "hiring partner", "campus hiring", "university recruiting", "hr",
+        "campus recruiting", "early careers", "university relations",
     ]),
     ("founder", ["founder", "co-founder", "cofounder"]),
     ("cto", ["cto", "chief technology officer", "chief technical officer"]),
